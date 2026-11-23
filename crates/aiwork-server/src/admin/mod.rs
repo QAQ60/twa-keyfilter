@@ -1,0 +1,311 @@
+//! 管理面模块（Web 化改造 T5/T6/T7 装配）：
+//! - T7 鉴权：token 加载/生成（env `AIWORK_ADMIN_TOKEN` 优先 → conf/admin_token）
+//!   + Cookie 会话中间件（`/api/login` 放行）；
+//! - T5 命令桥：`POST /api/cmd/{command}` 白名单分发到 aiwork-core（cmd_bridge）；
+//! - T6 SSE：`GET /api/events/checkin` 签到事件流（sse）。
+//!
+//! ADR-4：单管理员 token 模型——登录换取 HttpOnly Cookie，后续请求凭 Cookie 鉴权；
+//! 鉴权失败统一 401 `{"ok":false,"error":...}`，不产生逐请求噪音日志。
+
+mod admin_tokens;
+mod cmd_bridge;
+pub(crate) mod ip_allow;
+mod sse;
+mod ws;
+
+use std::sync::Arc;
+
+use aiwork_core::commands::checkin::CheckinGuard;
+use aiwork_core::fs_utils;
+use aiwork_core::state::AppState;
+use axum::body::Bytes;
+use axum::extract::{Request, State};
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::Router;
+use serde_json::json;
+
+/// 会话 Cookie 名
+const COOKIE_NAME: &str = "aiwork_admin";
+/// 会话有效期：7 天（秒）
+const COOKIE_MAX_AGE_SECS: u32 = 604_800;
+
+/// 管理面共享状态
+pub struct AdminState {
+    pub state: std::sync::Arc<aiwork_core::state::AppState>,
+    pub guard: std::sync::Arc<aiwork_core::commands::checkin::CheckinGuard>,
+    /// 签到事件广播：(事件名, 载荷)。事件名 = "checkin-progress" | "checkin-done"
+    /// （WorkBuddy 管线事件 wb-checkin-progress / wb-oauth-* 亦经此通道转发，SSE 客户端按事件名过滤）
+    pub events: tokio::sync::broadcast::Sender<(String, serde_json::Value)>,
+    /// 管理面 token（env AIWORK_ADMIN_TOKEN 优先；否则 conf/admin_token 读取/生成）
+    pub token: String,
+}
+
+impl AdminState {
+    /// 装配：token 加载/生成 + 广播通道（容量 256）
+    pub fn new(state: std::sync::Arc<AppState>) -> std::sync::Arc<Self> {
+        let token = load_or_create_token(&state);
+        // 附加管理员令牌缓存（T12b）：登录/鉴权并集校验的附加集
+        admin_tokens::reload(&state);
+        // 容量 256：慢消费者（SSE 端 lag）丢帧不阻塞签到工作线程，
+        // done 事件已落库 checkin_results，前端可降级轮询
+        let (events, _rx) = tokio::sync::broadcast::channel(256);
+        // 事件出口注入（移植 main）：scheduler 等后台模块经 AppState.events emit
+        // 看板刷新等软通知，本通道（WS/SSE）订阅后转发前端；未注入（None）时
+        // emit 静默丢弃——事件不参与业务正确性
+        *state.events.lock().unwrap_or_else(|e| e.into_inner()) = Some(events.clone());
+        Arc::new(Self {
+            state,
+            guard: Arc::new(CheckinGuard(tokio::sync::Mutex::new(()))),
+            events,
+            token,
+        })
+    }
+}
+
+/// token 加载/生成：
+/// 1. env `AIWORK_ADMIN_TOKEN` 非空即用（容器部署）；
+/// 2. 读 `<data_dir>/conf/admin_token`（已存在且非空直接复用）；
+/// 3. 生成 32 字节随机 hex（64 字符，OsRng，与 core::oauth::random_hex 同源实现）
+///    写入文件（unix 下权限 0600；Windows 跳过权限设置），并打日志提示路径。
+fn load_or_create_token(state: &AppState) -> String {
+    // 1) 环境变量优先
+    if let Ok(t) = std::env::var("AIWORK_ADMIN_TOKEN") {
+        let t = t.trim().to_string();
+        if !t.is_empty() {
+            return t;
+        }
+    }
+    // 2) 已有 token 文件
+    let path = state.conf_path("admin_token");
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        let s = s.trim().to_string();
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    // 3) 首次生成并落盘（写失败不影响本次进程内可用，仅重启后需重新登录）
+    let token = aiwork_core::commands::oauth::random_hex(64);
+    match std::fs::write(&path, &token) {
+        Ok(()) => {
+            // unix 下收紧权限：token 等同口令，仅属主可读写
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+            let msg = format!("管理面 token 已生成: {}", path.display());
+            println!("{msg}");
+            fs_utils::app_log(&state.data_dir, &msg);
+        }
+        Err(e) => {
+            let msg = format!("管理面 token 写入失败（{}）: {e}", path.display());
+            println!("{msg}");
+            fs_utils::app_log(&state.data_dir, &msg);
+        }
+    }
+    token
+}
+
+/// 从 Cookie 头手工解析指定 cookie 的值（不引第三方 cookie 库）。
+/// 形态：`name1=value1; name2=value2`（容忍分号/等号两侧空白；值不支持引号包裹）。
+fn cookie_value(raw: &str, name: &str) -> Option<String> {
+    raw.split(';')
+        .map(|p| p.trim())
+        .find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            k.trim()
+                .eq(name)
+                .then(|| v.trim().to_string())
+        })
+}
+
+/// 统一 JSON 响应（内容类型 application/json；正文为紧凑 JSON 字符串）
+pub(super) fn json_response(status: StatusCode, value: serde_json::Value) -> Response {
+    let body = serde_json::to_string(&value)
+        .unwrap_or_else(|_| r#"{"ok":false,"error":"序列化失败"}"#.to_string());
+    (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+/// 常量时间字节串比较（主管理令牌比对用）：无论长度是否一致，迭代次数仅由
+/// 被比较两侧长度的最大值决定，累积异或最后统一判定——消除理论时序侧信道。
+/// 不引入 subtle/subtlecrypto 依赖（std 无等价物，实现量级 12 行）
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    // 长度差以 usize 全宽参与累积（as u8 截断会丢 >255 的长度差）
+    let mut diff: usize = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= (x ^ y) as usize;
+    }
+    // black_box 阻止 LLVM 将「OR 累积」做语义等价的 early-exit 变换
+    std::hint::black_box(diff) == 0
+}
+
+/// T7 鉴权中间件：覆盖管理面路由整体；`/api/login` 放行，
+/// 其余请求校验 Cookie `aiwork_admin=<token>` 精确匹配，失败 → 401。
+/// WebUI 免令牌开关（settings.web_auth_disabled）开启时整体跳过鉴权，即时生效。
+pub(super) async fn auth_middleware(
+    State(admin): State<Arc<AdminState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    // 登录端点放行（其余路径一律鉴权）
+    if req.uri().path() == "/api/login" {
+        return next.run(req).await;
+    }
+    // 免令牌开关：每请求读 kv（无缓存），设置页切换后无需重启。
+    // 审查修复（第二轮，双门禁对齐网关 auth.rs）：非环回监听时忽略该开关——
+    // 容器/公网部署下 0.0.0.0 监听会让整张 /api/* 写命令表（账号导入/删除、
+    // api_keys_save、pool_set…）免鉴权，仅剩 IP 白名单一道防线
+    if admin.state.settings().web_auth_disabled
+        && aiwork_core::api_server::auth::listen_is_loopback()
+    {
+        return next.run(req).await;
+    }
+    let authorized = req
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| cookie_value(raw, COOKIE_NAME))
+        // 主 token 精确匹配 或 附加管理员令牌命中（T12b）；常量时间比较（令牌
+        // 比对不经业务数据分支，消除理论时序侧信道；两 token 均进程内可信长度）
+        .map(|c| ct_eq(c.as_bytes(), admin.token.as_bytes()) || admin_tokens::contains(&c))
+        .unwrap_or(false);
+    if authorized {
+        next.run(req).await
+    } else {
+        json_response(
+            StatusCode::UNAUTHORIZED,
+            json!({"ok": false, "error": "未登录或会话已过期"}),
+        )
+    }
+}
+
+/// POST /api/login：body `{"token": "..."}`；匹配 → 200 `{"ok":true}` +
+/// Set-Cookie 会话（HttpOnly / SameSite=Lax / 7 天，HTTPS 到达时附 Secure）；不匹配 → 401。
+async fn login(
+    State(admin): State<Arc<AdminState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    let supplied = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| {
+            v.get("token")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default();
+    // 主 token 或附加管理员令牌任一命中即可登录（T12b，主 token 常量时间比较）；
+    // 会话 Cookie 存登录所用 token
+    if !(ct_eq(supplied.as_bytes(), admin.token.as_bytes()) || admin_tokens::contains(&supplied)) {
+        // 失败审计（审查 B2）：0.0.0.0 部署时该端点全网可达，失败完全不可见
+        // = 爆破行为不可观测；按 ip_middleware 同口径记录来源 IP（不参与判定）
+        let ip = ip_allow::audit_ip(&headers, Some(peer.ip()))
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        fs_utils::app_log(&admin.state.data_dir, &format!("管理面登录失败（来源 ip={ip}）"));
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            json!({"ok": false, "error": "token 无效"}),
+        );
+    }
+    // 登录事件单条日志（无逐请求鉴权噪音）
+    let ip = ip_allow::audit_ip(&headers, Some(peer.ip()))
+        .map(|i| i.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    fs_utils::app_log(&admin.state.data_dir, &format!("管理面登录成功（来源 ip={ip}）"));
+    // Cookie 存登录所用 token（附加令牌登录时不得回写主 token，避免泄露）。
+    // Secure 属性（审查 B3）：仅当请求确认经 HTTPS 到达（反代 x-forwarded-proto）
+    // 时附加——纯 HTTP 内网部署带 Secure 会被浏览器拒收，无该头维持原行为
+    let via_https = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().eq_ignore_ascii_case("https"))
+        .unwrap_or(false);
+    let cookie = format!(
+        "{COOKIE_NAME}={}; HttpOnly; SameSite=Lax;{} Path=/; Max-Age={COOKIE_MAX_AGE_SECS}",
+        supplied,
+        if via_https { " Secure;" } else { "" },
+    );
+    let mut resp = json_response(StatusCode::OK, json!({"ok": true}));
+    if let Ok(v) = HeaderValue::from_str(&cookie) {
+        resp.headers_mut().append(header::SET_COOKIE, v);
+    }
+    resp
+}
+
+/// 管理面路由（含鉴权中间件层）：
+/// `POST /api/login` + `POST /api/cmd/{command}` + `GET /api/events/checkin`
+pub fn router(admin: Arc<AdminState>) -> Router {
+    let api = Router::new()
+        .route("/api/login", post(login))
+        .route("/api/cmd/:command", post(cmd_bridge::cmd_handler))
+        .route("/api/events/checkin", get(sse::checkin_events))
+        // WebSocket 双向推送（T12c）：鉴权层覆盖后再升级
+        .route("/api/ws", get(ws::ws_handler))
+        .with_state(admin.clone());
+    // 鉴权层覆盖整个 api（login 在中间件内放行）
+    api.layer(middleware::from_fn_with_state(admin.clone(), auth_middleware))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cookie 解析往返：标准 / 多 cookie / 顺序无关 / 空白容忍 / 缺失
+    #[test]
+    fn cookie_parse_roundtrip() {
+        assert_eq!(
+            cookie_value("aiwork_admin=abc123", COOKIE_NAME).as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(
+            cookie_value("theme=dark; aiwork_admin=abc123", COOKIE_NAME).as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(
+            cookie_value("aiwork_admin=abc123; theme=dark", COOKIE_NAME).as_deref(),
+            Some("abc123")
+        );
+        // 容忍等号/分号两侧空白
+        assert_eq!(
+            cookie_value("aiwork_admin = spaced ; theme=dark", COOKIE_NAME).as_deref(),
+            Some("spaced")
+        );
+        // 前缀同名 cookie 不误匹配
+        assert_eq!(
+            cookie_value("aiwork_admin_x=other; theme=dark", COOKIE_NAME),
+            None
+        );
+        assert_eq!(cookie_value("theme=dark", COOKIE_NAME), None);
+        assert_eq!(cookie_value("", COOKIE_NAME), None);
+    }
+
+    /// 会话 cookie 帧格式：HttpOnly + SameSite=Lax + Path=/ + Max-Age=7 天；
+    /// HTTPS 到达（x-forwarded-proto=https）时附加 Secure（审查 B3）
+    #[test]
+    fn login_cookie_frame_format() {
+        let base = format!(
+            "{COOKIE_NAME}=<token>; HttpOnly; SameSite=Lax;{} Path=/; Max-Age={COOKIE_MAX_AGE_SECS}",
+            ""
+        );
+        assert_eq!(
+            base,
+            "aiwork_admin=<token>; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800"
+        );
+        let secure = format!(
+            "{COOKIE_NAME}=<token>; HttpOnly; SameSite=Lax;{} Path=/; Max-Age={COOKIE_MAX_AGE_SECS}",
+            " Secure;"
+        );
+        assert_eq!(
+            secure,
+            "aiwork_admin=<token>; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age=604800"
+        );
+    }
+}

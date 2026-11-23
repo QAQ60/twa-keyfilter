@@ -1,0 +1,4520 @@
+//! WorkBuddy 上游请求路径（T2.1/T2.4/T2.7 集成点）
+//!
+//! 请求流程：
+//! 1. 模型级冷却检查（F-34：优先级高于 Key 级，命中直接快速失败）；
+//! 2. 会话粘性双模式（T2.4/F-31）：显式 conversationId / 前 3 消息指纹 60s 窗，
+//!    命中绑定则锁定账号与上游会话（双段分配）；
+//! 3. 上游请求（headers 三铁律 + 强制 stream + effort 降级 + 审核模板黑名单
+//!    最小改写）；
+//! 4. 分级重试（T2.2/F-33）：RetrySame 同号重试 / SwitchKey 换号（401 先刷新
+//!    一次凭证，T2.6）/ Fatal 透传终止；
+//! 5. SSE keep-alive 15s（T2.7/F-34）+ 首字超时 10s 故障转移；
+//! 6. 用量记账 + 请求级日志（含 TTFB，F-32）。
+//!
+//! 客户端断连（F-34 §5.5 #8，issue #41 系列 0028c93/73f3480/5abb891 修订）：
+//! 转发链路三层检测——轮换/重试入口 tx.is_closed() 快速终止、停滞期
+//! next_event_polling 轮询（LINE_POLL）、活跃流逐事件顶部检测；断连即终止
+//! 转发并释放账号并发槽（usage 记账取断连前已收到的上游 usage 事件，
+//! 不再为残缺流量保持消费上游到 EOF）。
+
+use std::collections::HashSet;
+use std::io::Read;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use axum::body::Body;
+use axum::http::StatusCode;
+use axum::response::Response;
+use serde_json::{json, Value};
+use tokio_stream::wrappers::ReceiverStream;
+
+use super::pool::PickedAccount;
+use super::retry::{retry_plan, RetryAction};
+use super::wb_payload;
+use super::wb_sse;
+use super::wb_sse::{cache_write_tokens_of, cached_tokens_of, u64_pair};
+use super::wb_sticky::SessionKey;
+use super::wb_upstream::{self, WbCreds};
+use super::{classify_error, ApiSharedState, ErrKind, InflightGuard};
+use crate::api_server::routes::{anthropic_error, openai_error, Protocol};
+
+// ==================== wb 族执行视图（buddy-ai 阶段 2 分流） ====================
+
+/// wb 族池视图（《Buddy国际版支持落地方案.md》§3.2/§4.2）：
+/// Buddy（CN，现状不动）与 BuddyAI（Intl 独立池）两条档位**共用三条执行路径**
+/// （流式 / 聚合 / toolexec），家族维度资源按视图分流，对话内核（SSE 转发、
+/// 非流式聚合、payload 归一化、换号收尾护栏）参数化复用零复制：
+///
+/// - 池：`route_pool()` → 共享态 wb 池 | buddy-ai 独立池（§3.1 硬约束 1 不混居）
+/// - 粘性：`route_sticky()` → wb 粘性存储（无前缀 ns）| buddy-ai 粘性存储（`g:` ns）；
+///   buddy-ai 档受 `buddy_ai_sticky_enabled` 开关门控（§4.2），wb 档恒开
+/// - 模型冷却：独立实例（同名模型跨区不混轮，§4.2）
+/// - 记账：`usage_bucket()` → `UsageBucket::Wb` | `UsageBucket::BuddyAi`（§3.1 硬约束 5）
+/// - 清洗模板：`wb_template_map` | `buddy_ai_template_map` 独立键（§4.3）
+/// - 池标签：`pool_label()` → `"buddy"` | `"buddy-ai"`（请求日志/Key 约束作用域）
+///
+/// Deref 到 [`ApiSharedState`]：共享字段（logger/data_dir/wb_sanitize/inflight 等）
+/// 经视图零改动访问；对冲竞速（race_first_byte）需要 'static 克隆，故持 Arc。
+#[derive(Clone)]
+pub(crate) struct WbView {
+    pub state: Arc<ApiSharedState>,
+    /// true = buddy-ai（国际版独立池）档
+    pub buddy_ai: bool,
+}
+
+impl WbView {
+    /// CN Buddy 档视图（现状路径，行为与改造前完全一致）
+    pub fn wb(state: Arc<ApiSharedState>) -> Self {
+        Self { state, buddy_ai: false }
+    }
+
+    /// Intl buddy-ai 档视图
+    pub fn intl(state: Arc<ApiSharedState>) -> Self {
+        Self { state, buddy_ai: true }
+    }
+
+    pub fn new(state: Arc<ApiSharedState>, buddy_ai: bool) -> Self {
+        if buddy_ai { Self::intl(state) } else { Self::wb(state) }
+    }
+
+    /// 家族池视图（执行路径取号/记账/冷却全走此池）
+    pub fn route_pool(&self) -> &super::pool::ApiPool {
+        if self.buddy_ai {
+            &self.state.buddy_ai_pool
+        } else {
+            &self.state.wb_pool
+        }
+    }
+
+    /// 家族显式会话粘性存储视图
+    pub fn route_sticky(&self) -> &super::wb_sticky::StickyStore {
+        if self.buddy_ai {
+            &self.state.buddy_ai_sticky
+        } else {
+            &self.state.wb_sticky
+        }
+    }
+
+    /// 家族竞速对冲阈值视图（per-pool 独立配置：CN 用 wb_hedge_threshold_ms，
+    /// Intl 用 buddy_ai_hedge_threshold_ms；0 = 关闭对冲）
+    pub fn route_hedge_ms(&self) -> u64 {
+        if self.buddy_ai {
+            self.state
+                .buddy_ai_hedge_threshold_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+        } else {
+            self.state
+                .wb_hedge_threshold_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    /// 家族模型级冷却表视图（独立实例：CN/Intl 同名模型不混轮）
+    pub fn route_model_cooldowns(&self) -> &Mutex<std::collections::HashMap<String, (i64, u32)>> {
+        if self.buddy_ai {
+            &self.state.buddy_ai_model_cooldowns
+        } else {
+            &self.state.model_cooldowns
+        }
+    }
+
+    /// 家族账号×模型冷却表视图（issue #206：429/SoftRate 记 (uid, model) 对，
+    /// 不钉账号级 until；CN/Intl 独立实例同 §4.2）
+    pub fn route_account_model_cooldowns(
+        &self,
+    ) -> &Mutex<std::collections::HashMap<(String, String), i64>> {
+        if self.buddy_ai {
+            &self.state.buddy_ai_account_model_cooldowns
+        } else {
+            &self.state.wb_account_model_cooldowns
+        }
+    }
+
+    /// 池标签（请求日志 pool 列 + Key 白名单约束作用域）
+    pub fn pool_label(&self) -> &'static str {
+        if self.buddy_ai { "buddy-ai" } else { "buddy" }
+    }
+
+    /// 记账桶（§3.1 硬约束 5：Intl 用量与国内分账）
+    pub fn usage_bucket(&self) -> super::usage::UsageBucket {
+        if self.buddy_ai {
+            super::usage::UsageBucket::BuddyAi
+        } else {
+            super::usage::UsageBucket::Wb
+        }
+    }
+
+    /// 显式会话粘性是否生效（§4.2：buddy-ai 档独立开关，默认关；wb 档恒开）
+    pub fn sticky_on(&self) -> bool {
+        !self.buddy_ai
+            || self
+                .state
+                .buddy_ai_sticky_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 粘性解析（带开关门控；关闭时恒 None，不读陈旧绑定）
+    pub fn sticky_resolve(
+        &self,
+        key: &SessionKey,
+        now: i64,
+    ) -> Option<super::wb_sticky::Binding> {
+        if !self.sticky_on() {
+            return None;
+        }
+        self.route_sticky().resolve(key, now)
+    }
+
+    /// 粘性绑定（带开关门控；关闭时静默跳过，unbind 不受影响可清陈旧绑定）
+    pub fn sticky_bind(&self, key: &SessionKey, uid: &str, conv_id: &str, now: i64) {
+        if !self.sticky_on() {
+            return;
+        }
+        self.route_sticky().bind(key, uid, conv_id, now);
+    }
+
+    /// 家族清洗模板键（§4.3 分区：wb_template_map | buddy_ai_template_map）
+    pub fn templates_key(&self) -> &'static str {
+        if self.buddy_ai { "buddy_ai_template_map" } else { "wb_template_map" }
+    }
+}
+
+impl std::ops::Deref for WbView {
+    type Target = ApiSharedState;
+
+    fn deref(&self) -> &ApiSharedState {
+        &self.state
+    }
+}
+
+/// 安全获取 Mutex 锁：若锁被毒化（panic 导致），仍恢复内部数据继续运行
+fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn now_ts() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 生成上游 conversation_id（粘性绑定的第二段：客户端会话 → 上游会话）
+pub(crate) fn gen_conv_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seed = (nanos as u64).wrapping_mul(0x517cc1b727220a95);
+    let mut buf = [0u8; 16];
+    buf[0..8].copy_from_slice(&seed.to_le_bytes());
+    buf[8..16].copy_from_slice(&(seed.wrapping_add(0x9e3779b97f4a7c15)).to_le_bytes());
+    let hex: String = buf.iter().map(|b| format!("{:02x}", b)).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32]
+    )
+}
+
+// ==================== 模型级冷却（T2.7/F-34） ====================
+
+/// 模型是否处于冷却中；返回剩余秒数（视图感知：buddy-ai 档读独立冷却表）
+// pub(crate)：参数持 crate 私有类型 WbView，本组函数无跨 crate 消费方
+//（消除 private_interfaces 警告）
+pub(crate) fn model_cooling_remaining(state: &WbView, model: &str) -> Option<i64> {
+    model_cooldown_remaining_on(state, state.buddy_ai, model)
+}
+
+/// 指定池档的模型冷却剩余秒数（issue #159 归因用）：不经 WbView 直接按 buddy_ai
+/// 布尔选冷却表——routes.rs 侧仅有 ApiSharedState（无视图上下文），池健康预检
+/// （dispatch pool_health）与此处读同一张表，归因才准确
+pub(crate) fn model_cooldown_remaining_on(
+    state: &ApiSharedState,
+    buddy_ai: bool,
+    model: &str,
+) -> Option<i64> {
+    let map = safe_lock(if buddy_ai {
+        &state.buddy_ai_model_cooldowns
+    } else {
+        &state.model_cooldowns
+    });
+    let (until, _) = map.get(model)?;
+    let now = now_ts();
+    if *until > now {
+        Some(*until - now)
+    } else {
+        None
+    }
+}
+
+/// 记录一次模型级失败：渐进退避 10→20→40s（封顶 40s，成功请求后清除）。
+/// 带错误消息时先尝试解析精确恢复时刻（note_model_failure_ex）。
+pub(crate) fn note_model_failure(state: &WbView, model: &str) {
+    note_model_failure_ex(state, model, None);
+}
+
+/// 记录一次模型级失败（带可选上游错误消息）：
+/// ① 消息含「将在 YYYY-MM-DD HH:MM:SS UTC+8 重置」文案（WB 6004 限额，agent2api
+///    errors.rs 情报互证 2026-10-03）→ 冷却至精确恢复时刻（钳制 ≤7 天防异常值）；
+/// ② 解析失败/无消息 → 既有渐进退避。后续不可解析的失败取「渐进退避 vs 既有
+///    冷却截止」的较大者——账号实际仍被限额到恢复时刻，不能被 10s 渐进值缩短。
+pub(crate) fn note_model_failure_ex(state: &WbView, model: &str, msg: Option<&str>) {
+    let mut map = safe_lock(&state.route_model_cooldowns());
+    let (prev_until, fails) = map.get(model).copied().unwrap_or((0, 0));
+    let fails = fails + 1;
+    let now = now_ts();
+    let until = match msg.and_then(parse_quota_reset_at) {
+        Some(ts) => ts,
+        None => {
+            let delay = 10i64 << (fails - 1).min(2); // 10/20/40
+            (now + delay).max(prev_until)
+        }
+    };
+    map.insert(model.to_string(), (until, fails));
+}
+
+// ==================== 账号×模型维度冷却（issue #206） ====================
+
+/// 账号×模型冷却钳制下限（60s）与上限（7 天，防异常远期值钉死配对）
+const AM_COOLDOWN_MIN_SECS: i64 = 60;
+const AM_COOLDOWN_MAX_SECS: i64 = 7 * 24 * 3600;
+
+/// 记录一次账号×模型维度冷却（issue #206）：429（SoftRate）上游实为模型维度
+/// 限流——只记 (uid, model) 对的冷却截止，不写账号级 until（否则一个模型被限
+/// → 全池进冷却 → 其他模型 503 no healthy account）。
+/// 值钳制 [now+60s, now+7d]，且取与既有值的较大者防缩短。
+pub(crate) fn note_account_model_cooldown(state: &WbView, uid: &str, model: &str, until: i64) {
+    let now = now_ts();
+    let until = until.clamp(now + AM_COOLDOWN_MIN_SECS, now + AM_COOLDOWN_MAX_SECS);
+    let mut map = safe_lock(&state.route_account_model_cooldowns());
+    let entry = map
+        .entry((uid.to_string(), model.to_string()))
+        .or_insert(until);
+    if until > *entry {
+        *entry = until;
+    }
+}
+
+/// 指定账号×模型的冷却剩余秒数（None = 未冷却/已过期）
+pub(crate) fn account_model_cooling_remaining(
+    state: &WbView,
+    uid: &str,
+    model: &str,
+) -> Option<i64> {
+    let map = safe_lock(&state.route_account_model_cooldowns());
+    let until = *map.get(&(uid.to_string(), model.to_string()))?;
+    let now = now_ts();
+    if until > now {
+        Some(until - now)
+    } else {
+        None
+    }
+}
+
+/// 成功请求后清除账号×模型冷却对（与 clear_model_failure 同触发点）
+pub(crate) fn clear_account_model_cooldown(state: &WbView, uid: &str, model: &str) {
+    safe_lock(&state.route_account_model_cooldowns())
+        .remove(&(uid.to_string(), model.to_string()));
+}
+
+/// 清空指定账号的全部账号×模型冷却（账号级禁用/凭证失效等场景调用）
+pub(crate) fn clear_account_model_cooldowns_for(state: &WbView, uid: &str) {
+    let mut map = safe_lock(&state.route_account_model_cooldowns());
+    map.retain(|k, _| k.0 != uid);
+}
+
+/// 从限额文案解析精确恢复时刻（agent2api parse_quota_reset_at 同源语义）：
+/// 命中 `UTC+8` 字面量后向前扫描 `YYYY-MM-DD HH:MM:SS`（按 UTC+8 解释为 Unix 秒）。
+/// 零正则依赖（项目约定）；有效性钳制：必须在未来且 ≤7 天——上游改措辞/时区
+/// 即解析失败，调用方落回渐进退避（本函数只作快路径，不承担唯一职责）。
+/// 复审修复：遍历**所有**锚点——文案可能含两个时刻（「您于 X UTC+8 触发限额，
+/// 将在 Y UTC+8 重置」），首个锚点前是过去时刻（触发时间），跳过它继续找下一个，
+/// 直到解析出可信的未来恢复时刻。
+pub(crate) fn parse_quota_reset_at(msg: &str) -> Option<i64> {
+    const DT_LEN: usize = 19; // yyyy-mm-dd hh:mm:ss
+    let bytes = msg.as_bytes();
+    let mut from = 0usize;
+    loop {
+        let anchor = msg[from..].find("UTC+8")? + from;
+        from = anchor + "UTC+8".len();
+        if anchor >= DT_LEN {
+            // 从锚点紧前方回扫，最多 48 字节（文案前缀长度）
+            let start_limit = anchor.saturating_sub(48);
+            let mut i = anchor - DT_LEN;
+            loop {
+                if let Some(ts) = try_parse_dt(bytes, i) {
+                    let now = now_ts();
+                    // 未来且 ≤7 天才可信（解析到过去时刻/异常远期 = 该时刻不是恢复时刻）
+                    if ts > now && ts - now <= 7 * 24 * 3600 {
+                        return Some(ts);
+                    }
+                    break; // 此锚点解析出的时刻不可信 → 换下一个锚点
+                }
+                if i == start_limit {
+                    break;
+                }
+                i -= 1;
+            }
+        }
+    }
+}
+
+/// 在 bytes[i..] 处匹配 `dddd-dd-dd dd:dd:dd` 并按 UTC+8 解析为 Unix 秒
+fn try_parse_dt(b: &[u8], i: usize) -> Option<i64> {
+    if i + 19 > b.len() {
+        return None;
+    }
+    let p = &b[i..i + 19];
+    let digit = |x: u8| x.is_ascii_digit();
+    let sep = |x: u8, c: u8| x == c;
+    let num = |s: &[u8]| -> Option<i64> {
+        s.iter().try_fold(0i64, |acc, c| {
+            if digit(*c) { Some(acc * 10 + (*c - b'0') as i64) } else { None }
+        })
+    };
+    let shape = sep(p[4], b'-')
+        && sep(p[7], b'-')
+        && sep(p[10], b' ')
+        && sep(p[13], b':')
+        && sep(p[16], b':')
+        && p[0..4].iter().all(|c| digit(*c))
+        && digit(p[5])
+        && digit(p[6])
+        && digit(p[8])
+        && digit(p[9])
+        && digit(p[11])
+        && digit(p[12])
+        && digit(p[14])
+        && digit(p[15])
+        && digit(p[17])
+        && digit(p[18]);
+    if !shape {
+        return None;
+    }
+    let (y, mo, d) = (num(&p[0..4])?, num(&p[5..7])?, num(&p[8..10])?);
+    let (h, mi, s) = (num(&p[11..13])?, num(&p[14..16])?, num(&p[17..19])?);
+    // 按 UTC+8 解释：Unix 时刻 = naive(UTC 解释) - 8h
+    chrono::NaiveDate::from_ymd_opt(y as i32, mo as u32, d as u32)
+        .and_then(|date| date.and_hms_opt(h as u32, mi as u32, s as u32))
+        .map(|dt| dt.and_utc().timestamp() - 8 * 3600)
+}
+
+/// 从上游 HTTP 错误响应体提取 message（6004 限额文案随 JSON body 下发）；
+/// 兼容 message / error.message / msg（腾讯系接口两种字段名都有）；
+/// 解析失败返回 None → 调用方落回渐进退避
+fn upstream_msg(resp_body: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(resp_body).ok()?;
+    v.get("message")
+        .and_then(|m| m.as_str())
+        .or_else(|| v.pointer("/error/message").and_then(|m| m.as_str()))
+        .or_else(|| v.get("msg").and_then(|m| m.as_str()))
+        .map(str::to_string)
+}
+
+/// 从上游错误文案解析**账号级**解冻时刻（issue #159，pool::note_error_until 配套）：
+/// ① 绝对时刻：复用 parse_quota_reset_at（「将在 YYYY-MM-DD HH:MM:SS UTC+8 重置」）；
+/// ② 相对秒：「N秒后…」「N 秒后…」「Ns后…」「after Ns / after N seconds」等
+///    恢复/重试话术。
+/// 返回 Unix 秒，有效性钳制与 parse_quota_reset_at 同口径（未来且 ≤7 天）。
+/// 账号级/模型级冷却解耦后，该值仅供 note_error_until 冷却对应账号，
+/// 不再连带冷却整池同名模型（原缺陷：单账号限额把模型冷却表钉到解冻时刻 →
+/// pool_health 跳过整个 buddy 池 → 回退池无账号 → 503 no healthy）
+pub(crate) fn parse_account_unfreeze_at(msg: &str) -> Option<i64> {
+    if let Some(ts) = parse_quota_reset_at(msg) {
+        return Some(ts);
+    }
+    parse_relative_unfreeze_secs(msg).map(|secs| now_ts() + secs)
+}
+
+/// 相对秒形态解析（零正则，项目约定）：
+/// - 中文锚点「秒后」「s后」：数字在锚点前（允许一个空格），如「30秒后重试」「45s后恢复」；
+/// - 英文锚点「after」「 in 」：数字在锚点后（允许空格），且必须跟完整词形秒单位
+///   （s/sec/secs/second/seconds，大小写不敏感，单位后须为词边界）——
+///   防「after 3 min」「in 10 steps」等非秒词误判。
+/// - 中英文锚点整体大小写不敏感（审查修复）：入口统一 ASCII 小写化，仅转写
+///   ASCII 字节，「30S后」「After 30 Seconds」等混合大小写变体与文档词形一致命中。
+/// 数字有效性：>0 且 ≤7 天；超长数字段（>9 位）视为解析异常不命中；
+/// 数字段前紧贴「.」「,」视为小数/千分位片段（如「3.5s后」）不命中，避免截断误读
+fn parse_relative_unfreeze_secs(msg: &str) -> Option<i64> {
+    const MAX_SECS: i64 = 7 * 24 * 3600;
+    // 审查修复：入口统一 ASCII 小写化（中文锚点「秒后」与数字不受影响），
+    // 消除「S后」「After」等大写变体的解析缺口；单位匹配由归一化覆盖（eq 精确比较）
+    let lower = msg.to_ascii_lowercase();
+    let msg = lower.as_str();
+    let b = msg.as_bytes();
+    // 从 i（不含）向前跳过一个空格后回扫连续 ASCII 数字，返回数值
+    fn digits_before(b: &[u8], i: usize) -> Option<i64> {
+        let mut j = i;
+        if j > 0 && b[j - 1] == b' ' {
+            j -= 1;
+        }
+        let end = j;
+        while j > 0 && b[j - 1].is_ascii_digit() {
+            j -= 1;
+        }
+        if j == end || end - j > 9 {
+            return None;
+        }
+        // 审查修复：数字段前紧贴「.」或「,」为小数/千分位片段（如「3.5s后」会截成
+        // 5、「1,500秒后」会截成 500），拒绝命中交由默认固定时长冷却兜底
+        if j > 0 && (b[j - 1] == b'.' || b[j - 1] == b',') {
+            return None;
+        }
+        b[j..end].iter().try_fold(0i64, |acc, c| {
+            acc.checked_mul(10)
+                .and_then(|a| a.checked_add((*c - b'0') as i64))
+        })
+    }
+    // 中文锚点（数字在锚点前）
+    for anchor in ["秒后", "s后"] {
+        let mut from = 0usize;
+        while let Some(rel) = msg[from..].find(anchor) {
+            let at = from + rel;
+            if let Some(v) = digits_before(b, at).filter(|v| *v > 0 && *v <= MAX_SECS) {
+                return Some(v);
+            }
+            from = at + anchor.len();
+        }
+    }
+    // 英文锚点（数字在锚点后，秒单位须为完整词形 s/sec/secs/second/seconds）
+    for anchor in ["after", " in "] {
+        let mut from = 0usize;
+        while let Some(rel) = msg[from..].find(anchor) {
+            let mut i = from + rel + anchor.len();
+            while i < b.len() && b[i] == b' ' {
+                i += 1;
+            }
+            let start = i;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i > start && i - start <= 9 {
+                let mut j = i;
+                if j < b.len() && b[j] == b' ' {
+                    j += 1;
+                }
+                // 审查修复：单位须为完整词形（大小写不敏感）且后接词边界（非
+                // ASCII 字母数字），防「steps/sessions」类 s 开头非秒词误判
+                for unit in [
+                    "seconds".as_bytes(),
+                    "second".as_bytes(),
+                    "secs".as_bytes(),
+                    "sec".as_bytes(),
+                    "s".as_bytes(),
+                ] {
+                    let k = j + unit.len();
+                    if k <= b.len()
+                        && &b[j..k] == unit
+                        && (k >= b.len() || !b[k].is_ascii_alphanumeric())
+                    {
+                        if let Ok(v) = msg[start..i].parse::<i64>() {
+                            if v > 0 && v <= MAX_SECS {
+                                return Some(v);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            from = start.max(from + anchor.len());
+        }
+    }
+    None
+}
+
+/// 请求成功后清除该模型的冷却与失败计数
+pub(crate) fn clear_model_failure(state: &WbView, model: &str) {
+    safe_lock(&state.route_model_cooldowns()).remove(model);
+}
+
+// ==================== 统一错误记账入口（issue #206） ====================
+
+/// wb 族上游错误统一记账（6 处站点共用，issue #206）：
+/// - SoftRate（429 模型维度限流）→ 只记账号×模型冷却对 `(uid, model)`，
+///   **不再写账号级 until**（改前钉全账号 4~7h → 一个模型被限 → 全池瘫痪，
+///   其他模型 503 no healthy account）；也不写整池模型冷却表（防回归 issue #159）。
+///   解冻优先级：上游文案解析 > Retry-After 秒 > SoftRate 固定时长兜底。
+/// - Server/NotFound/Client（网关/模型级故障）→ 维持整池模型级冷却
+///   （note_model_failure_ex）+ 账号级 note_error_until（既有行为）。
+/// - SessionDead/Forbidden/HardCredit/PlanLimit/None → 维持账号级
+///   note_error_until 现状（PlanLimit 是账号订阅档位问题，与模型维度限流不同源）。
+/// - kind.unbinds_sticky() 硬冷却/禁用类解绑粘性（既有行为）。
+///
+/// `retry_after_secs`：HTTP 429 响应头 Retry-After（秒），仅流式 HTTP 路径有值。
+pub(crate) fn note_wb_error(
+    state: &WbView,
+    uid: &str,
+    model: &str,
+    kind: ErrKind,
+    upstream_msg: Option<&str>,
+    retry_after_secs: Option<u64>,
+) {
+    if kind == ErrKind::None {
+        return;
+    }
+    if kind == ErrKind::SoftRate {
+        // issue #206：解冻时刻解析（复用账号级解析逻辑）→ Retry-After → 固定时长
+        // Retry-After 先钳到账号×模型冷却上限再相加：超大（甚至恶意）头值直接
+        // now + s 会溢出 i64（debug 构建 panic / release 回绕变负），反而把解冻
+        // 时刻钉到过去立即"解冻"（审查修复：防超大 Retry-After 溢出）
+        let unfreeze = parse_account_unfreeze_at(upstream_msg.unwrap_or(""))
+            .or_else(|| {
+                retry_after_secs.map(|s| {
+                    let s = s.min(AM_COOLDOWN_MAX_SECS as u64).max(1);
+                    now_ts() + s as i64
+                })
+            })
+            .unwrap_or_else(|| now_ts() + kind.cooldown_duration().as_secs() as i64);
+        note_account_model_cooldown(state, uid, model, unfreeze);
+        // 有意不进 note_error_until → 不计 e.failures（审查确认的取舍）：429 是
+        // 模型维度限流而非账号质量问题，成功率因子（weighted_score）不应惩罚账号；
+        // 补 F-80 风格观测行（审查问题 3）：账号级冷却不再落 account cooldown 日志，
+        // 429 限流事件须可从 app.log 回答「该账号对该模型为何不可用/何时解冻」
+        state.logger.log_sched_event(&format!(
+            "account cooldown: pool={} acct-model uid={} model={} kind=soft_rate \
+             action=am_cooldown secs={} until={}",
+            state.pool_label(),
+            uid,
+            model,
+            unfreeze - now_ts(),
+            unfreeze,
+        ));
+        return;
+    }
+    // 其余类别维持既有账本：账号级 note_error_until（含熔断/禁用/硬冷却）
+    let unfreeze = parse_account_unfreeze_at(upstream_msg.unwrap_or(""));
+    state.route_pool().note_error_until(uid, kind, unfreeze);
+    // 模型级冷却仅对网关/模型级故障生效（issue #159 解耦）
+    if matches!(kind, ErrKind::Server | ErrKind::NotFound | ErrKind::Client) {
+        note_model_failure_ex(state, model, upstream_msg);
+    }
+    if kind.unbinds_sticky() {
+        state.route_sticky().unbind_uid(uid);
+        // 硬冷却/禁用类：账号整体不可用，连带清其全部账号×模型冷却对
+        clear_account_model_cooldowns_for(state, uid);
+    }
+}
+
+// ==================== 审核模板映射热更新（T2.1） ====================
+
+/// 每请求读取外置映射表（fs_utils::read_json_cached：mtime+size 线程安全缓存，
+/// 免自建缓存结构与 Mutex 内磁盘 IO）；data/ 新路径缺失回退旧根路径（存量数据
+/// 兼容）；KV 缺失/损坏/空表 = 纯默认。issue #99 ⑥ 合并语义：内置默认表全量
+/// 生效，自定义表按 from 逐字覆盖（merged_template_rules）——默认表新增布防
+/// 规则自动对存量自定义生效，不再被旧「整体替代」语义吞掉
+pub(crate) fn load_templates(state: &WbView) -> Vec<(String, String)> {
+    // SQLite 化（P2）：data/wb_template_map.json → kv `wb_template_map`（热路径单行读取）；
+    // buddy-ai 档独立键 `buddy_ai_template_map`（§4.3 分区清洗）
+    let custom = crate::store::db(&state.data_dir)
+        .kv_get::<wb_payload::TemplateMapFile>(state.templates_key())
+        .into_rules();
+    wb_payload::merged_template_rules(custom)
+}
+
+/// 工具别名表加载（issue #150）：kv `tool_alias_map`，合并语义同模板表
+/// （内置默认全量生效，自定义按 from 覆盖/追加，to=null/空串=停用）。
+/// 单键不分档；当前接线面：① Trae 池（routes.rs solo 管线：流式/聚合/对冲
+/// converted2/11128 rebuild 重放 + 响应侧 sse.rs 四回改点）；② Qoder 池
+/// （issue #158 P1-1/P1-2：qoder_route 经 `apply_tool_alias_forward_value`
+/// 在 active_peek 上改写 → 响应侧 wb_sse 三回改点 + completion_to_anthropic 逆
+/// 映射，受 `qoder_sanitize` 池级开关门控）；③ WB 族池（Buddy CN / BuddyAI Intl
+/// 共用本文件三入口：wb_stream_chat / wb_aggregate_chat / wb_tool_exec_chat，
+/// 请求侧 `apply_tool_alias_forward` + 11128 重建后重做，响应侧
+/// stream_forward_ex / aggregate / completion_to_anthropic 逆映射，受
+/// `wb_sanitize` 池级开关门控）。工具集指纹是上游风控家族共性，三池同键复用
+///（分档无收益）；每请求读取（kv 单行 + mtime 缓存），保存即对下一请求生效
+pub(crate) fn load_tool_alias_rules(state: &WbView) -> Vec<(String, String)> {
+    let custom = crate::store::db(&state.data_dir)
+        .kv_get::<wb_payload::ToolAliasFile>("tool_alias_map")
+        .into_rules();
+    wb_payload::merged_tool_alias_rules(custom)
+}
+
+/// 11128 终局统一落样本（issue #195 第二轮审查④抽公共 helper，六处 Fatal 站点
+/// 口径一致）：指纹样本+本次命中流水日志、显式/清洗后两条样本入环形缓冲、
+/// 池级指纹短记忆标记、清洗后残留自检。样本由调用点取（来源各异：请求原文
+/// body_vec / chat_body 序列化），按请求去重守卫（last_11128_sample）与终局
+/// 说明（清洗后仍命中=模板需更新 vs 内容已流出=不可同号重试）留在调用点。
+/// probe（issue #195 三期 B1）：Some((creds, model)) 时终局以 detach 线程追加
+/// 归因探针——同号新会话极简规范请求二分风控维度（账号/池标记 vs 内容残留），
+/// 结论只落日志不改重试策略
+fn log_and_record_11128(
+    state: &WbView,
+    sample: &str,
+    converted: &[u8],
+    tool_alias_rules: &[(String, String)],
+    hit_cursor: u64,
+    probe: Option<(&WbCreds, &str)>,
+) {
+    let note = wb_payload::template_hit_note();
+    // 本次请求实际命中（issue #195 方案 B5）：游标之后的模板/别名命中流水，
+    // 替代进程级累计值的误导性
+    let per_req = wb_payload::template_hits_since(hit_cursor);
+    let per_req_note = if per_req.is_empty() {
+        String::new()
+    } else {
+        format!("；本次命中: {}", per_req.join(", "))
+    };
+    state
+        .logger
+        .log_sched_event(&format!("11128 指纹样本: {}{}{}", sample, note, per_req_note));
+    // issue #125 增强：同步入内存样本环形缓冲（UI「指纹清洗」tab 一键生成规则）
+    wb_payload::record_fingerprint_sample("11128", state.pool_label(), sample, &note);
+    // 清洗后样本（issue #195 方案 B2）：原样与清洗产物同落「指纹样本」环形缓冲，
+    // 进出对比漏网现形
+    let cleaned = wb_payload::fingerprint_sample(converted);
+    state
+        .logger
+        .log_sched_event(&format!("11128 清洗后指纹样本: {cleaned}{per_req_note}"));
+    wb_payload::record_fingerprint_sample("11128_cleaned", state.pool_label(), &cleaned, &note);
+    // issue #195：显式 11128 与空完成主导同视为渠道指纹确认，标记池级短记忆
+    // ——TTL 内同池新请求首轮即激进起步（prepare 末参经 fp_block_recent 生效），
+    // 不再每次都先吃一次 11128 才升级
+    wb_payload::mark_channel_fp_block(state.pool_label(), true);
+    // 清洗后残留自检（issue #195 可观测性，方案 B3 扩展到 tools 维度）：给出
+    // 清洗产物仍命中的已知特征词/未生效别名，缩小漏网排查面；命中词深藏在
+    // 指纹样本 2000 字符截断之外时（issue #195 二期：v3.9.2 dsh-code-review
+    // 预设描述中段品牌词实证），附 ±80 字符上下文片段定位残留原文
+    if let Some(res) =
+        wb_payload::residual_fingerprint_note_rules_bytes(converted, tool_alias_rules)
+    {
+        let ctx = wb_payload::residual_fingerprint_context_bytes(converted);
+        let msg = if ctx.is_empty() {
+            format!("11128 清洗后残留自检: {res}")
+        } else {
+            format!("11128 清洗后残留自检: {res}；残留上下文: {ctx}")
+        };
+        state.logger.log_sched_event(&msg);
+    }
+    // 归因探针（issue #195 三期 B1）：目前无法断定风控原因——清洗已净仍被拦
+    // 时用同一账号发极简规范请求二分定位（账号/池标记 vs 内容残留），以日志
+    // 证据收敛后再修复；结论只落日志，不改 Fatal 语义
+    if let Some((creds, model)) = probe {
+        probe_11128_account_marked(state, creds, model);
+    }
+}
+
+/// 11128 归因探针（issue #195 三期 B1）：用**触发 11128 的同一账号**发一次
+/// 极简规范请求（无 tools、一句通用 system，零客户端指纹；会话用 gen_conv_id()
+/// 新 id 隔离会话维度——探针只二分账号/池维度 vs 内容维度，X-Conversation
+/// 三头由 make_wb_request 按新 id 同源补齐），二分定位风控维度：
+/// - 探针仍 11128 → 账号/池维度标记嫌疑（内容无关——建议换号/换池对照验证；
+///   11-09 同形态曾通过的记录提示标记可能随时效/池轮换消退）；
+/// - 探针通过 → 内容残留嫌疑（指纹样本/残留自检已落上方日志，继续模板
+///   路线热更新收敛）。
+/// 探针 detach 线程执行（ureq 读路径无整体超时上限，同步会拖延客户端 Fatal
+/// 错误下发）；仅 Fatal 终局执行一次；自身网络/响应异常 → 归因未知不落结论
+/// （防误导）。结论只落日志，不改重试策略
+fn probe_11128_account_marked(state: &WbView, creds: &WbCreds, model: &str) {
+    // 进程级探针去重（2026-11-20 审查修复，Medium）：FP_BLOCK_TTL（600s）窗口内
+    // 客户端重试风暴会让每个 11128 Fatal 终局都 spawn 探针线程向真实上游发请求
+    // （耗账号额度 + 放大上游压力），且 detach 线程读路径无整体超时、上游挂起时
+    // 永久滞留。11128 归因是全局性结论（指纹/通道问题），600s 内一次探针足够；
+    // compare_exchange 原子占位防并发双发。
+    const PROBE_DEDUP_SECS: i64 = 600;
+    static LAST_PROBE_TS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    let now = now_ts();
+    let prev = LAST_PROBE_TS.load(std::sync::atomic::Ordering::Relaxed);
+    if now - prev < PROBE_DEDUP_SECS
+        || LAST_PROBE_TS
+            .compare_exchange(
+                prev,
+                now,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+    {
+        state
+            .logger
+            .log_sched_event("[11128 归因探针] 600s 内已发起过探针（进程级去重），本轮跳过");
+        return;
+    }
+    let creds = creds.clone();
+    let model = model.to_string();
+    let spawn = std::thread::Builder::new()
+        .name("wb-11128-probe".to_string())
+        .spawn({
+            let state = state.clone();
+            move || probe_11128_probe_run(state, creds, model)
+        });
+    if let Err(e) = spawn {
+        state
+            .logger
+            .log_sched_event(&format!("[11128 归因探针] 探针线程启动失败，归因未知: {e}"));
+    }
+}
+
+/// 探针线程体（detach 发射后不管；持 WbView/WbCreds 克隆，'static）
+fn probe_11128_probe_run(state: WbView, creds: WbCreds, model: String) {
+    let conv_id = gen_conv_id();
+    state.logger.log_sched_event(&format!(
+        "[11128 归因探针] 发起：同号新会话极简规范请求 pool={} uid={} model={model}",
+        state.pool_label(),
+        creds.uid
+    ));
+    let body = serde_json::json!({
+        "model": model,
+        "stream": true,
+        "conversation_id": conv_id,
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "hi"}
+        ]
+    });
+    let body_bytes = match serde_json::to_vec(&body) {
+        Ok(b) => b,
+        Err(_) => {
+            state
+                .logger
+                .log_sched_event("[11128 归因探针] 探针体序列化失败，归因未知");
+            return;
+        }
+    };
+    let blocked = match wb_upstream::make_wb_request(&creds, &conv_id, &body_bytes) {
+        Ok(reader) => {
+            // HTTP 200：11128 亦可能以 SSE 错误帧形态下发（issue #123 实证）；
+            // 极简请求响应极短，读到 EOF 扫全文即可。判定只走
+            // is_illegal_channel_error（"code":11128 键值精确匹配 + 英文关键词）
+            // ——裸匹配数字 11128 会与 usage 帧 token 计数误撞（retry.rs 既定口径）
+            let mut reader = std::io::BufReader::new(reader);
+            let mut text = String::new();
+            // 审查修复（2026-11-20，Medium）：读取中途失败（text 可能截断）或 EOF 但
+            // 响应为空（上游立即断连/空 body）都不足以判定「未命中 11128 → 内容残留
+            // 嫌疑」——网络/响应异常一律归因未知，防把排查方向误导到「继续加清洗规则」
+            //（与函数自声明的「自身网络/响应异常 → 归因未知不落结论」原则一致）
+            if reader.read_to_string(&mut text).is_err() || text.trim().is_empty() {
+                state
+                    .logger
+                    .log_sched_event("[11128 归因探针] 响应读取失败或为空响应，归因未知");
+                return;
+            }
+            super::retry::is_illegal_channel_error(&text)
+        }
+        Err((code, ref msg, _)) => {
+            if code == 400 && super::retry::is_illegal_channel_error(msg) {
+                true
+            } else {
+                // 非 11128 上游错误（401/429/5xx…）：探针结论未知，不误导归因
+                state.logger.log_sched_event(&format!(
+                    "[11128 归因探针] 探针收到非 11128 上游错误（HTTP {code}），归因未知"
+                ));
+                return;
+            }
+        }
+    };
+    let verdict = if blocked {
+        "[11128 归因探针] 结论：同号新会话极简规范请求仍被拦（无工具/零指纹内容）→ 账号/池维度标记嫌疑；建议换号或换池对照验证（内容路线无需再加规则）"
+    } else {
+        "[11128 归因探针] 结论：同号新会话极简规范请求通过 → 内容残留嫌疑；以上方指纹样本+残留自检定位漏网句，UI「指纹清洗」tab 热更新规则"
+    };
+    state.logger.log_sched_event(verdict);
+}
+
+// ==================== 错误分类（WB 上游） ====================
+
+/// WB 流内错误 → ErrKind：WB 无 SOLO 业务码体系，按类 HTTP 状态码 +
+/// message 关键词判定（积分耗尽标记词表集中维护，F-33）
+pub fn classify_wb_error(code: i64, msg: &str) -> ErrKind {
+    // 传输层读错误哨兵（M3 审查收口）显式归 Server：msg 携带上游 io 文本，
+    // 关键词兜底可能误撞（如 "Too many open files" 命中下方 "too many" →
+    // SoftRate 60s），削弱读超时/慢上游的熔断恢复能力
+    if super::is_transport_read_err(code, msg) {
+        return ErrKind::Server;
+    }
+    // 审查修复（M1）：4001/模型级豁免——模型在当前 function 下不可用是模型问题
+    // 非账号问题（与 mod.rs classify_error/classify_solo_error 同口径），返回 None
+    // 不冷却账号；否则单模型故障会被误判 Server 级触发整池 30 分钟熔断
+    if code == 4001 || super::is_model_config_mismatch(msg) {
+        return ErrKind::None;
+    }
+    // 11140 账号级风控（issue #136 反馈）：账号被上游限制使用 → Forbidden
+    // 禁用为内存态，无手动启用入口——申诉处理后重启应用或重新登录账号即随
+    // 池快照重建恢复调度；流内走既有 kind 分支——
+    // 未流出 break 换号接替 / 已流出就地收尾，禁用与解绑粘性由 note_error 生效
+    // （注释纠偏 port main 2fe9396）
+    if code == 11140 || super::retry::is_account_restricted_error(msg) {
+        return ErrKind::Forbidden;
+    }
+    // 4054 精确码（issue #212/#151）：上游模型侧瞬态过载，非账号质量问题 →
+    // SoftRate 60s 账号×模型冷却。原兜底 code>=400 → Client 10 分钟冷却会
+    // 误杀健康账号，池小则饿死成 503 no healthy account
+    if code == 4054 {
+        return ErrKind::SoftRate;
+    }
+    let lower = msg.to_lowercase();
+    if code == 401 || lower.contains("unauthorized") || lower.contains("token expired") {
+        return ErrKind::SessionDead;
+    }
+    if code == 403 || lower.contains("forbidden") || lower.contains("banned") {
+        return ErrKind::Forbidden;
+    }
+    if lower.contains("insufficient credit")
+        || lower.contains("积分不足")
+        || lower.contains("额度不足")
+        || lower.contains("quota exceeded")
+    {
+        return ErrKind::HardCredit;
+    }
+    if code == 429 || lower.contains("rate") || lower.contains("too many") || lower.contains("限频") {
+        return ErrKind::SoftRate;
+    }
+    // 短语兜底（issue #212/#151）：code 未带 4054 的「模型请求失败，请稍后
+    // 重试」形态 → SoftRate。置于关键词分支之后，避免复合文案（积分不足/
+    // token expired 等含「请稍后重试」）被劫持改判，硬限额/会话失效优先
+    if super::retry::is_retry_later_error(msg) {
+        return ErrKind::SoftRate;
+    }
+    if code >= 500 {
+        return ErrKind::Server;
+    }
+    // 未识别的 4xx：客户端侧错误（换号重试无意义），Client 短冷却即可；
+    // 归 Server 会误触 30m 账号熔断。code<400 的未知业务码维持 Server 保守判定。
+    if code >= 400 {
+        return ErrKind::Client;
+    }
+    ErrKind::Server
+}
+
+/// WB 族 HTTP 状态码错误路径专用分类（2026-11-20 审查修复，High）：wb_stream_chat /
+/// wb_aggregate_chat / wb_tool_exec_chat 的非 2xx 分支原用通用 `classify_error`，
+/// 其无 WB 特有分支——HTTP 形态的 4054/「请稍后重试」会误落 Client（10 分钟账号级
+/// 冷却，正是 #212/#151 在流内路径修掉的误杀：池小则饿死成 503）；`quota exceeded`
+/// 被 classify_error 有意排除（Trae 4008=频率限流），WB 侧却是硬性配额耗尽 →
+/// 冷却维度分裂。先套 WB 特有判定（与流内 classify_wb_error 同源），未命中回落
+/// 通用分类器（401→SessionDead / 429→SoftRate / 404→NotFound 等状态码口径不变）。
+fn classify_wb_http_error(status: u16, body: &str) -> ErrKind {
+    // 4054 精确码：优先于短语判定（对齐 classify_wb_error 分支顺序）
+    if super::retry::contains_code_value(body, "4054") {
+        return ErrKind::SoftRate;
+    }
+    // quota exceeded（WB 口径 = 硬性配额耗尽）：置于「请稍后重试」短语之前，
+    // 防复合文案（积分不足附带请稍后重试）被劫持改判
+    if body.to_lowercase().contains("quota exceeded") {
+        return ErrKind::HardCredit;
+    }
+    // 「模型请求失败，请稍后重试」短语兜底（is_retry_later_error 内含双词同现）
+    if super::retry::is_retry_later_error(body) {
+        return ErrKind::SoftRate;
+    }
+    classify_error(status, body)
+}
+
+// ==================== F-76③ 慢请求竞速对冲（取号侧编排） ====================
+
+/// 对冲账号在途计数租约（F-76③/F-77，P0 泄漏修复）：
+/// 构造即 +1（竞速窗口占用），Drop 即 -1——建连失败（闭包内 `?` 提前返回）、
+/// 双败（`lines_with_first_byte_hedged` Err 路径内 Drop）、竞速胜出
+/// （随 `RaceOutcome.hedge` 移交调用方，`settle_hedge` 落定后 Drop）三类
+/// 退出路径均恰好释放一次，杜绝计数泄漏导致的账号永久 busy。
+struct HedgeLease {
+    /// 对冲账号 uid（日志 / guard 重绑定位）
+    uid: String,
+    /// 该账号在途计数句柄（与 `wb_pool.inflight_handle(uid)` 同一 Arc）
+    counter: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl HedgeLease {
+    fn acquire(state: &WbView, uid: &str) -> Self {
+        let counter = state.route_pool().inflight_handle(uid);
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self { uid: uid.to_string(), counter }
+    }
+}
+
+impl Drop for HedgeLease {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// 竞速桥接行源读错误（wb_upstream 共享槽）合并进 error_info（issue #158 P2-2）：
+/// 行源被 `Box<dyn Iterator>` 擦拭类型 + `from_iterator` 桥接后，wb_sse 层只见
+/// 桥 EOF，读错误须由路由层从槽取出。仅覆盖「无错误」与「空完成哨兵」两种占位
+/// ——流内业务错误帧的 error_info 更具诊断价值，保留不覆盖。
+/// 返回 Some(哨兵) 表示该流/聚合被读错误终结（-9902 传输掐断或 -9903 普通
+/// 读错误，M3 按掐断特征分流）。
+fn merge_transport_cut_info(
+    error_info: Option<(i64, String)>,
+    read_slot: &wb_upstream::ReadErrSlot,
+) -> Option<(i64, String)> {
+    match super::read_error_sentinel_from_slot(read_slot) {
+        Some(cut) => match error_info {
+            None => Some(cut),
+            Some((c, m)) if super::is_empty_completion(c, &m) => Some(cut),
+            other => other,
+        },
+        None => error_info,
+    }
+}
+
+/// 聚合路径的掐断结果改写：槽有读错误时丢弃部分响应（非流式不得把截断数据
+/// 当成功交付，可能含残缺 tool_calls JSON），改写为 (None, Some(哨兵)) 走
+/// 流内错误换号路径；业务错误已存在时保留。空完成哨兵同样覆盖（审查修复：
+/// 零内容掐断时 aggregate 先落空完成哨兵，is_none() 守卫会漏合并——掐断被
+/// 计入空完成指纹口径，轮换耗尽时可误判 CHANNEL_FINGERPRINT_BLOCK；与流式
+/// merge_transport_cut_info 同口径：网络掐断不属于空完成）
+fn aggregate_with_transport_cut(
+    resp: Option<serde_json::Value>,
+    error_info: Option<(i64, String)>,
+    read_slot: &wb_upstream::ReadErrSlot,
+) -> (Option<serde_json::Value>, Option<(i64, String)>) {
+    match super::read_error_sentinel_from_slot(read_slot) {
+        Some(cut) => match error_info {
+            None => (None, Some(cut)),
+            Some((c, m)) if super::is_empty_completion(c, &m) => (None, Some(cut)),
+            other => (resp, other),
+        },
+        None => (resp, error_info),
+    }
+}
+
+/// 首字竞速胜者信息：生效账号（主/对冲接管者）+ 对冲计数租约
+struct RaceWin {
+    lines: Box<dyn Iterator<Item = String> + Send>,
+    /// 生效账号 uid（对冲接管时为对冲账号）
+    uid: String,
+    /// 对冲侧计数租约（None = 未触发对冲；Some = 竞速已定，待 settle 释放）
+    hedge: Option<HedgeLease>,
+    /// 对冲接管（对冲请求先出首字）
+    takeover: bool,
+    /// 审查修复（L2）：竞速败者已死标记（EOF/IO/超窗，随 RaceOutcome 透传），
+    /// settle_hedge 据此对败者补记错误/冷却，账单可解释
+    primary_failed: bool,
+    hedge_failed: bool,
+    /// 胜者行源读错误共享槽（issue #158 P2-2）：行源被 Box 擦拭类型 + 桥接
+    /// 后，relay 线程的 io::Error 只能经槽跨层读取——路由层在 EOF 兜底处
+    /// 取出合并为传输掐断哨兵
+    read_slot: wb_upstream::ReadErrSlot,
+}
+
+/// 首字竞速（F-76③）：对冲关闭（阈值 0）时与纯首字超时语义完全一致；开启时
+/// 主请求首字超阈值 → 从池内取第二账号（走同一 busy 过滤/负载因子——主账号已
+/// inflight 天然让位，受 F-77 并发上限约束）发对冲请求，先出首字者胜。
+/// 对冲账号取号时在途计数 +1 由 `HedgeLease` RAII 管理全生命周期；
+/// 接管时 guard 重绑到对冲账号（流计数随流存续）。
+#[allow(clippy::too_many_arguments)]
+fn race_first_byte(
+    state: &WbView,
+    primary_uid: &str,
+    conv_id: &str,
+    model: &str,
+    converted: &[u8],
+    reader: Box<dyn Read + Send>,
+    tried: &HashSet<String>,
+    allowed: Option<&HashSet<String>>,
+    dedicated: Option<&str>,
+) -> Result<RaceWin, ()> {
+    let hedge_ms = state.route_hedge_ms();
+    // issue #138：对冲关闭（hedge_ms==0）或大 body（> HEDGE_SKIP_BODY_BYTES，
+    // 对冲需 converted.to_vec() 全量快照 + 按 hedge 账号重建缓存键（H3），
+    // 瞬时内存放大得不偿失）时均退化为纯首字超时（语义与关闭对冲一致）
+    if hedge_ms == 0 || converted.len() > super::routes::HEDGE_SKIP_BODY_BYTES {
+        // P2-2：tracked 变体——行源被 Box 擦拭类型后读错误须经共享槽跨层读取
+        let read_slot = wb_upstream::new_read_err_slot();
+        return wb_upstream::lines_with_first_byte_timeout_tracked(reader, read_slot.clone())
+            .map(|lines| RaceWin {
+                lines,
+                uid: primary_uid.to_string(),
+                hedge: None,
+                takeover: false,
+                primary_failed: false,
+                hedge_failed: false,
+                read_slot,
+            });
+    }
+    let state2 = state.clone();
+    let tried2 = tried.clone();
+    let allowed2 = allowed.cloned();
+    let dedicated2 = dedicated.map(str::to_string);
+    let body = converted.to_vec();
+    // issue #206：对冲取号同样按账号×模型冷却过滤（模型名随闭包捕获）
+    let model2 = model.to_string();
+    let view2 = state.clone();
+    // 对冲闭包 move 捕获（同 body 取快照）：conv_id 随闭包存续
+    let conv_id2 = conv_id.to_string();
+    // 审查修复（L2）：捕获对冲账号 uid（仅建连成功 = 对冲实际发起时记录）——
+    // 双败 Err 路径租约随竞速 Drop、无从取 uid，Err 时据此对对冲侧补记错误
+    let hedge_uid_cell = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+    let hedge_uid_slot = hedge_uid_cell.clone();
+    let spawn_backup = move || -> Option<(Box<dyn Read + Send>, HedgeLease)> {
+        let (picked2, ev) = state2.route_pool().pick_excluding_constrained_ev_matching(
+            &tried2,
+            allowed2.as_ref(),
+            dedicated2.as_deref(),
+            false,
+            &|uid| account_model_cooling_remaining(&view2, uid, &model2).is_none(),
+        )?;
+        // F-77⑤ 可观测：对冲取号同样记录 busy 让位/降级事件
+        if let Some(ev) = ev {
+            state2.logger.log_sched_event(&ev);
+        }
+        // 租约先于建连获取：建连失败（下行 `?`）时随闭包局部变量 Drop 自动 -1
+        let lease = HedgeLease::acquire(&state2, &picked2.uid);
+        let creds2 = WbCreds {
+            id: picked2.uid.clone(),
+            uid: picked2.uid.clone(),
+            name: String::new(),
+            token: picked2.jwt.clone(),
+            domain: picked2.domain.clone(),
+            enterprise_id: picked2.enterprise_id.clone(),
+            global_region: picked2.global_region,
+        };
+        // H3 审查修复：body 是主账号 prepared 形态，prompt_cache_key 由主账号
+        // uid 派生——对冲账号直接复用会把主账号的缓存键带上游（跨账号前缀
+        // 缓存污染 / 对话内容泄露通道，违背账号硬隔离红线），必须按对冲账号
+        // 重建。重建失败（非对象/键缺失）沿用原 body（宁缺勿造语义不变）
+        let body2 = super::wb_payload::rewrite_prompt_cache_key_for(
+            &body,
+            &picked2.uid,
+            &conv_id2,
+        )
+        .unwrap_or_else(|| body.clone());
+        let reader2 = wb_upstream::make_wb_request(&creds2, &conv_id2, &body2).ok()?;
+        *hedge_uid_slot.borrow_mut() = Some(picked2.uid.clone());
+        Some((reader2, lease))
+    };
+    match wb_upstream::lines_with_first_byte_hedged(reader, hedge_ms, spawn_backup) {
+        Ok(out) => {
+            let uid = if out.takeover {
+                out.hedge
+                    .as_ref()
+                    .map(|l| l.uid.clone())
+                    .unwrap_or_else(|| primary_uid.to_string())
+            } else {
+                primary_uid.to_string()
+            };
+            Ok(RaceWin {
+                uid,
+                lines: out.lines,
+                hedge: out.hedge,
+                takeover: out.takeover,
+                primary_failed: out.primary_failed,
+                hedge_failed: out.hedge_failed,
+                read_slot: out.read_slot,
+            })
+        }
+        Err(()) => {
+            // 审查修复（L2）：双败时对冲侧同样记 Server 错误（主侧由调用方按
+            // picked.uid 记，与本处对齐）——失败请求留失败痕迹，账单可解释
+            if let Some(huid) = hedge_uid_cell.borrow().as_deref() {
+                state.route_pool().note_error(huid, ErrKind::Server);
+            }
+            Err(())
+        }
+    }
+}
+
+/// 竞速结束后处理对冲计数与日志（F-76③/F-77）：
+/// - 释放对冲账号竞速窗口的在途占用（租约 Drop，-1 恰好一次）；
+/// - 接管时 guard 重绑到对冲账号（原账号解绑 -1、对冲账号 +1，流计数随流存续）；
+/// - [SCHED] 日志记录 hedge_takeover / hedge_lost；
+/// - 审查修复（L2）：竞速败者记账——已死一侧（EOF/IO/超窗）补记 Server 错误
+///   触发冷却；仅「输竞速但未死」一侧不记（账号健康，防误伤）
+fn settle_hedge(
+    state: &WbView,
+    win: &mut RaceWin,
+    mut guard: InflightGuard,
+    primary_uid: &str,
+) -> InflightGuard {
+    if win.primary_failed {
+        state.route_pool().note_error(primary_uid, ErrKind::Server);
+    }
+    if win.hedge_failed {
+        if let Some(lease) = win.hedge.as_ref() {
+            state.route_pool().note_error(&lease.uid, ErrKind::Server);
+        }
+    }
+    // take 移交所有权：本函数返回前 Drop（竞速窗口计数 -1 恰好一次）
+    let Some(lease) = win.hedge.take() else {
+        return guard;
+    };
+    let hedge_uid = lease.uid.as_str();
+    if win.takeover {
+        state.logger.log_sched_event(&format!(
+            "hedge_takeover primary={} hedge={}",
+            primary_uid, hedge_uid
+        ));
+        guard = guard.bind_account(lease.counter.clone());
+    } else {
+        state.logger.log_sched_event(&format!(
+            "hedge_lost primary={} hedge={}",
+            primary_uid, hedge_uid
+        ));
+    }
+    drop(lease); // 释放竞速窗口占用（接管路径先重绑流计数再释放，语义与原实现一致）
+    guard
+}
+
+/// 长上下文提示（F-76④）：输入粗估超阈值时返回 (token 估算, 降档开关状态)
+fn longctx_estimate(state: &WbView, peek: &Value) -> Option<(u64, bool)> {
+    let t = super::wb_model_route::estimate_input_tokens(peek);
+    if t < super::wb_model_route::LONGCTX_TOKEN_THRESHOLD {
+        return None;
+    }
+    Some((
+        t,
+        state
+            .wb_longctx_downgrade
+            .load(std::sync::atomic::Ordering::Relaxed),
+    ))
+}
+
+/// 上下文过大提示日志（F-76④：仅标注不做真裁剪）
+fn log_longctx_hint(state: &WbView, peek: &Value, model: &str) {
+    if let Some((tokens, downgrade)) = longctx_estimate(state, peek) {
+        state.logger.log_sched_event(&format!(
+            "longctx_hint model={} tokens≈{}k downgrade={}",
+            model,
+            tokens / 1000,
+            downgrade
+        ));
+    }
+}
+
+// ==================== 换号重试预算（issue #213 阶段2） ====================
+
+/// 预算耗尽判定（issue #213 阶段2，纯函数便于单测）：`rounds` = 本请求内累计
+/// 发起过上游请求的账号次数（跨重开轮换累计、不清零，见 run_wb_stream/
+/// wb_aggregate_core 的 budget_used）；`budget` = 0 即旧行为（耗尽直接收尾）。
+pub(crate) fn budget_exhausted(rounds: u32, budget: u32) -> bool {
+    budget == 0 || rounds >= budget
+}
+
+/// 预算重开抖动退避毫秒（方案 §5.3：base 2s × 轮次，±25% 抖动，封顶 15s；
+/// `round` = 已耗尽轮数（≥1））。轮次时长基于轮换计数而非池大小，池大小不可靠
+///（tried 里可能混入粘性/专一候选）。
+pub(crate) fn budget_backoff_ms(round: u32) -> u64 {
+    let base = (2_000u64.saturating_mul(round as u64)).min(15_000);
+    // ±25% 抖动：[base*0.75, base*1.25)，时间戳取模（对齐 server.rs jitter 先例）
+    let span = (base / 4).max(1);
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    base - span + (seed % (2 * span))
+}
+
+/// 轮换耗尽 + 预算未用尽时的重开判定（方案 §5.3）：清空 tried 中所有**非冷却中**
+/// 账号（清空 = 移出 tried，下一轮可被 pick 重选），冷却截止未到的 uid 保留在
+/// tried 中（pick 继续排除，不烧已判定不可用的号）。返回 Some(新 tried) = 重开
+/// 成功（调用方 sleep 后 continue 轮换）；None = 全部已试账号均进冷却（无可重试
+/// 候选，无重开意义）或预算用尽，落原耗尽收尾，防空转烧请求。
+pub(crate) fn budget_retry_round(
+    state: &WbView,
+    tried: &HashSet<String>,
+    model: &str,
+    rounds: u32,
+    budget: u32,
+) -> Option<HashSet<String>> {
+    if budget_exhausted(rounds, budget) {
+        return None;
+    }
+    let mut kept = HashSet::new();
+    for uid in tried.iter() {
+        if account_model_cooling_remaining(state, uid, model).is_some() {
+            kept.insert(uid.clone());
+        }
+    }
+    // 全部已试账号均进冷却 → 重开只会得到同一批被排除账号，无重开意义
+    //（kept.len() < tried.len() = 至少存在一个非冷却账号可重试）
+    if kept.len() < tried.len() {
+        Some(kept)
+    } else {
+        None
+    }
+}
+
+// ==================== 伪流式 SSE 帧合成（issue #213 §4.4） ====================
+
+/// delta 切片粒度（§4.4 决策点 3）：~512 字符切片拆多个 delta 帧——兼容按
+/// delta 计数做进度条的客户端；纯帧粒度调整，语义不变
+const SSE_DELTA_CHUNK_CHARS: usize = 512;
+
+/// 按字符边界切片（禁止按字节切出半个 UTF-8）：chars.collect 后按块切
+fn chunk_chars(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    chars
+        .chunks(SSE_DELTA_CHUNK_CHARS)
+        .map(|c| c.iter().collect())
+        .collect()
+}
+
+/// 伪流式 SSE 通道帧类型（issue #213 §4.4/S5）：与 wb_stream_chat 流通道同型
+/// （Sender<Result<Bytes, io::Error>>）——keep-alive ticker、ReceiverStream 组装、
+/// 跨池移交 continue_stream_on_next_pool（要求 Result 型通道）共用同一通道类型
+type SseTx = tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>;
+
+/// 伪流式 SSE 合成（issue #213 §4.4）：聚合 completion 按客户端协议合成 SSE 帧
+/// 序列，tx 逐帧 blocking_send（内核在 spawn_blocking 同步上下文中调用）。发送
+/// 失败（客户端断连）立即 return。
+///
+/// 帧序列规格（严格照 docs/pending §4.4）：
+/// - OpenAi：role 帧 → 内容帧（512 切片）→ tool_calls/stop 收尾 → [usage 帧] → [DONE]
+/// - Anthropic：message_start → content_block_start → text_delta×N →
+///   content_block_stop → [tool_use 块×N] → message_delta → message_stop
+/// - Responses：复用 tool_exec 现成合成口径（created → items → completed）
+/// - OpenAiText：text 帧×N → finish 帧 → [DONE]
+pub(crate) fn synthesize_sse(
+    tx: &SseTx,
+    proto: Protocol,
+    completion: &Value,
+    chat_id: &str,
+    model: &str,
+    encoded: &HashSet<String>,
+) {
+    match proto {
+        Protocol::OpenAi => synth_openai(tx, completion, chat_id, model),
+        Protocol::Anthropic => synth_anthropic(tx, completion, chat_id, model),
+        Protocol::Responses => synth_responses(tx, completion, chat_id, model, encoded),
+        Protocol::OpenAiText => synth_openai_text(tx, completion, chat_id, model),
+    }
+}
+
+/// 发送一帧（`data: {json}\n\n`）；失败（客户端断连）返回 false
+fn send_data(tx: &SseTx, data: &Value) -> bool {
+    send_raw(tx, &format!("data: {data}\n\n"))
+}
+
+/// 发送一帧（`event: {name}\ndata: {json}\n\n`）；失败返回 false
+fn send_event(tx: &SseTx, event: &str, data: &Value) -> bool {
+    send_raw(tx, &format!("event: {event}\ndata: {data}\n\n"))
+}
+
+/// 原始帧发送；blocking_send 失败（接收端已关闭 = 客户端断连）→ false
+fn send_raw(tx: &SseTx, frame: &str) -> bool {
+    tx.blocking_send(Ok(bytes::Bytes::from(frame.to_string()))).is_ok()
+}
+
+/// 伪流式耗尽/Fatal 收尾错误帧（issue #213 S5）：本池轮换耗尽且无 fallback 或
+/// 移交失败、以及 Fatal 终局时，按客户端协议发各自错误帧防静默断流。
+/// docker 适配：不复制 main 的 send_pseudo_exhaust_frame 原始帧构造，统一收敛
+/// 到 send_stream_error_wb → routes::send_stream_error_full（docker 侧加固同款：
+/// Anthropic 合成收口、Responses 复用 responses_object 骨架，与 run_wb_stream
+/// 耗尽收尾同一出口）；文案对齐 main：帧 code 保持字符串 no_healthy_account，
+/// message 为 exhaust/fatal 文案
+fn send_pseudo_exhaust_frame(tx: &SseTx, proto: Protocol, model: &str, exhaust_msg: &str) {
+    send_stream_error_wb(tx, proto, model, json!("no_healthy_account"), exhaust_msg);
+}
+
+/// choice/message 提取（completion 侧与 wb_sse::completion_to_anthropic 同口径）
+fn synth_choice(completion: &Value) -> (Value, Value) {
+    let choice = completion
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .cloned()
+        .unwrap_or(json!({}));
+    let message = choice.get("message").cloned().unwrap_or(json!({}));
+    (choice, message)
+}
+
+/// 上游 finish_reason → OpenAI 流式收尾帧语义（stop / tool_calls）
+fn synth_finish_stream(choice: &Value, message: &Value) -> &'static str {
+    let has_tool_calls = message
+        .get("tool_calls")
+        .and_then(|t| t.as_array())
+        .is_some_and(|a| !a.is_empty());
+    if has_tool_calls {
+        "tool_calls"
+    } else {
+        match choice.get("finish_reason").and_then(|f| f.as_str()) {
+            Some("tool_calls") | Some("function_call") => "tool_calls",
+            _ => "stop",
+        }
+    }
+}
+
+/// OpenAI /v1/chat/completions 伪流式帧序列
+fn synth_openai(
+    tx: &SseTx,
+    completion: &Value,
+    chat_id: &str,
+    model: &str,
+) {
+    // 审查修复：chat_id 由入口按 proto 生成时已带前缀（chatcmpl-/cmpl-/msg_/resp_），
+    // 此处直接使用，不得二次拼前缀（否则产出 "chatcmpl-chatcmpl-…" 畸形 ID）
+    let id = chat_id.to_string();
+    let created = now_ts();
+    let chunk = |delta: Value, finish: Value| {
+        json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        })
+    };
+    // 首帧：role 帧
+    if !send_data(tx, &chunk(json!({"role": "assistant", "content": ""}), Value::Null)) {
+        return;
+    }
+    let (choice, message) = synth_choice(completion);
+    let tool_calls = message
+        .get("tool_calls")
+        .and_then(|t| t.as_array())
+        .filter(|a| !a.is_empty())
+        .cloned();
+    if let Some(tcs) = tool_calls.as_ref() {
+        // 内容帧（有文本仍先下发文本）
+        let text = message.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        for piece in chunk_chars(text) {
+            if !send_data(tx, &chunk(json!({"content": piece}), Value::Null)) {
+                return;
+            }
+        }
+        // tool_calls 按 index 逐项完整下发（id/type/function.name/arguments 整段）
+        for tc in tcs {
+            if !send_data(tx, &chunk(json!({"tool_calls": [tc]}), Value::Null)) {
+                return;
+            }
+        }
+    } else {
+        let text = message.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        for piece in chunk_chars(text) {
+            if !send_data(tx, &chunk(json!({"content": piece}), Value::Null)) {
+                return;
+            }
+        }
+    }
+    // usage 帧（completion.usage 非空时补，choices:[]，对齐 stream_options.include_usage）
+    let usage = completion.get("usage").filter(|u| !u.is_null());
+    if let Some(u) = usage {
+        let mut frame = chunk(json!({}), Value::Null);
+        frame["choices"] = json!([]);
+        frame["usage"] = u.clone();
+        if !send_data(tx, &frame) {
+            return;
+        }
+    }
+    // 收尾帧
+    let finish = synth_finish_stream(&choice, &message);
+    if !send_data(tx, &chunk(json!({}), json!(finish))) {
+        return;
+    }
+    let _ = send_raw(tx, "data: [DONE]\n\n");
+}
+
+/// Anthropic /v1/messages 伪流式事件序列
+fn synth_anthropic(
+    tx: &SseTx,
+    completion: &Value,
+    chat_id: &str,
+    model: &str,
+) {
+    let (choice, message) = synth_choice(completion);
+    let (it, ot) = completion.get("usage").map(u64_pair).unwrap_or((0, 0));
+    // message_start（usage.output_tokens 起始 1，对齐 Anthropic 流式惯例与 §4.4 规格样例）
+    let msg_start = json!({
+        "type": "message_start",
+        "message": {
+            "id": chat_id,
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {"input_tokens": it, "output_tokens": 1},
+        },
+    });
+    if !send_event(tx, "message_start", &msg_start) {
+        return;
+    }
+    let mut index: i64 = 0;
+    let mut stop_reason = "end_turn";
+    // reasoning_content → thinking block（与 completion_to_anthropic 同口径，置于 text 之前）
+    if let Some(t) = message
+        .get("reasoning_content")
+        .and_then(|c| c.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        if !send_event(tx, "content_block_start", &json!({
+            "type": "content_block_start", "index": index,
+            "content_block": {"type": "thinking", "thinking": ""},
+        })) {
+            return;
+        }
+        for piece in chunk_chars(t) {
+            if !send_event(tx, "content_block_delta", &json!({
+                "type": "content_block_delta", "index": index,
+                "delta": {"type": "thinking_delta", "thinking": piece},
+            })) {
+                return;
+            }
+        }
+        if !send_event(tx, "content_block_stop", &json!({
+            "type": "content_block_stop", "index": index,
+        })) {
+            return;
+        }
+        index += 1;
+    }
+    // text block（内容非空才开块；completion_to_anthropic 投影同样空文本不出块）
+    if let Some(t) = message.get("content").and_then(|c| c.as_str()).filter(|s| !s.is_empty()) {
+        if !send_event(tx, "content_block_start", &json!({
+            "type": "content_block_start", "index": index,
+            "content_block": {"type": "text", "text": ""},
+        })) {
+            return;
+        }
+        for piece in chunk_chars(t) {
+            if !send_event(tx, "content_block_delta", &json!({
+                "type": "content_block_delta", "index": index,
+                "delta": {"type": "text_delta", "text": piece},
+            })) {
+                return;
+            }
+        }
+        if !send_event(tx, "content_block_stop", &json!({
+            "type": "content_block_stop", "index": index,
+        })) {
+            return;
+        }
+        index += 1;
+    }
+    // tool_use 块：每个 tool_call 一块（input_json_delta 整段 arguments）
+    if let Some(tcs) = message.get("tool_calls").and_then(|t| t.as_array()) {
+        for tc in tcs {
+            let args = tc
+                .pointer("/function/arguments")
+                .and_then(|a| a.as_str())
+                .unwrap_or("{}")
+                .to_string();
+            let id = tc.get("id").cloned().unwrap_or(json!("toolu_0"));
+            let name = tc
+                .pointer("/function/name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            if !send_event(tx, "content_block_start", &json!({
+                "type": "content_block_start", "index": index,
+                "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}},
+            })) {
+                return;
+            }
+            if !send_event(tx, "content_block_delta", &json!({
+                "type": "content_block_delta", "index": index,
+                "delta": {"type": "input_json_delta", "partial_json": args},
+            })) {
+                return;
+            }
+            if !send_event(tx, "content_block_stop", &json!({
+                "type": "content_block_stop", "index": index,
+            })) {
+                return;
+            }
+            index += 1;
+            stop_reason = "tool_use";
+        }
+    }
+    // 全空兜底（completion_to_anthropic 空内容兜底同口径）：补空 text 块
+    if index == 0 {
+        if !send_event(tx, "content_block_start", &json!({
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        })) {
+            return;
+        }
+        if !send_event(tx, "content_block_stop", &json!({
+            "type": "content_block_stop", "index": 0,
+        })) {
+            return;
+        }
+    }
+    // message_delta + message_stop
+    let finish = choice.get("finish_reason").and_then(|f| f.as_str()).unwrap_or("");
+    if stop_reason != "tool_use" {
+        stop_reason = match finish {
+            "length" => "max_tokens",
+            "content_filter" => "refusal",
+            _ => "end_turn",
+        };
+    }
+    let msg_delta = json!({
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+        "usage": {"output_tokens": ot},
+    });
+    if !send_event(tx, "message_delta", &msg_delta) {
+        return;
+    }
+    let _ = send_event(tx, "message_stop", &json!({"type": "message_stop"}));
+}
+
+/// Responses /v1/responses 伪流式事件序列：复用 wb_tool_exec 现成合成口径
+/// （created → output_item.added → delta×N → output_item.done → completed），
+/// delta 按 512 字符切片（tool_exec 原为整段一帧，此处粒度调整语义不变）
+fn synth_responses(
+    tx: &SseTx,
+    completion: &Value,
+    chat_id: &str,
+    model: &str,
+    encoded: &HashSet<String>,
+) {
+    // 审查修复：chat_id 已带 resp_ 前缀（同 synth_openai 注释），直接使用
+    let resp_id = chat_id.to_string();
+    let mut resp_obj = super::wb_responses::completion_to_responses(completion, &resp_id, model, encoded);
+    resp_obj["model"] = json!(model);
+    let send = |event: &str, data: &Value| -> bool { send_event(tx, event, data) };
+    let mut created = resp_obj.clone();
+    created["status"] = json!("in_progress");
+    created["output"] = json!([]);
+    if !send("response.created", &json!({"type": "response.created", "response": created})) {
+        return;
+    }
+    let output_items = resp_obj
+        .get("output")
+        .and_then(|o| o.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for (i, item) in output_items.iter().enumerate() {
+        if !send("response.output_item.added", &json!({
+            "type": "response.output_item.added",
+            "output_index": i,
+            "item": item,
+        })) {
+            return;
+        }
+        // message 文本增量（512 切片多帧）
+        if item.get("type").and_then(|v| v.as_str()) == Some("message") {
+            if let Some(text) = item
+                .pointer("/content/0/text")
+                .and_then(|t| t.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                for piece in chunk_chars(text) {
+                    if !send("response.output_text.delta", &json!({
+                        "type": "response.output_text.delta",
+                        "item_id": item.get("id").cloned().unwrap_or(json!("")),
+                        "output_index": i,
+                        "content_index": 0,
+                        "delta": piece,
+                    })) {
+                        return;
+                    }
+                }
+            }
+        }
+        // function_call 参数增量（512 切片多帧）
+        if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
+            if let Some(args) = item
+                .get("arguments")
+                .and_then(|a| a.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                for piece in chunk_chars(args) {
+                    if !send("response.function_call_arguments.delta", &json!({
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": item.get("id").cloned().unwrap_or(json!("")),
+                        "output_index": i,
+                        "delta": piece,
+                    })) {
+                        return;
+                    }
+                }
+            }
+        }
+        if !send("response.output_item.done", &json!({
+            "type": "response.output_item.done",
+            "output_index": i,
+            "item": item,
+        })) {
+            return;
+        }
+    }
+    let _ = send("response.completed", &json!({"type": "response.completed", "response": resp_obj}));
+}
+
+/// OpenAiText /v1/completions 伪流式帧序列
+fn synth_openai_text(
+    tx: &SseTx,
+    completion: &Value,
+    chat_id: &str,
+    model: &str,
+) {
+    let text = completion
+        .pointer("/choices/0/message/content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    let finish = completion
+        .pointer("/choices/0/finish_reason")
+        .and_then(|f| f.as_str())
+        .unwrap_or("stop");
+    for piece in chunk_chars(text) {
+        if !send_data(tx, &json!({
+            "id": chat_id,
+            "object": "text_completion",
+            "choices": [{"index": 0, "text": piece, "finish_reason": null}],
+            "model": model,
+        })) {
+            return;
+        }
+    }
+    if !send_data(tx, &json!({
+        "id": chat_id,
+        "object": "text_completion",
+        "choices": [{"index": 0, "text": "", "finish_reason": finish}],
+        "model": model,
+    })) {
+        return;
+    }
+    let _ = send_raw(tx, "data: [DONE]\n\n");
+}
+
+// ==================== 流式入口 ====================
+
+pub fn wb_stream_chat(
+    state: Arc<ApiSharedState>,
+    buddy_ai: bool,
+    body_vec: Vec<u8>,
+    model: String,
+    start_ts: Instant,
+    proto: Protocol,
+    key_id: String,
+    guard: InflightGuard,
+    encoded: std::collections::HashSet<String>,
+    fallback: Vec<super::dispatch::PoolCandidate>,
+) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+    // 批次 D-1 线程隔离：流任务迁入专用阻塞池（见 mod.rs stream_runtime 注释）
+    super::stream_runtime().spawn_blocking(move || {
+        // inflight guard 随后台任务存续至流结束（§4.5，客户端断连由 Drop 兜底）；
+        // 取号后经 bind_account 维护账号级在途计数（F-77），流结束 Drop 配对释放
+        let chat_id = match proto {
+            Protocol::OpenAi => format!("chatcmpl-{}", now_ts()),
+            Protocol::OpenAiText => format!("cmpl-{}", now_ts()),
+            Protocol::Anthropic => format!("msg_{}", now_ts()),
+            Protocol::Responses => format!("resp_{}", now_ts()),
+        };
+
+        // SSE keep-alive 15s（T2.7/F-34 §5.5 #7：防中间层回收长流）。
+        // P1 修复：与 routes.rs 同款 watch + DoneSignal 方案，替换旧 AtomicBool
+        // 15s 轮询（主任务发完后 ticker 仍可空转至多一个 15s 周期，流终结被拖延）；
+        // 主任务结束（DoneSignal Drop，含 panic 展开）置 done=true，ticker select!
+        // 收到退出信号即退出 → sender 全部关闭 → 流正常终结
+        let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
+        let _done = super::routes::DoneSignal(done_tx);
+        {
+            let tx2 = tx.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+                tick.tick().await; // 首个 tick 立即返回，跳过
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            if tx2
+                                .send(Ok(bytes::Bytes::from(": keep-alive\n\n")))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        // 主任务已结束：ticker 退出，放行流终结
+                        _ = done_rx.changed() => break,
+                    }
+                }
+            });
+        }
+
+        // wb 族池视图（§3.2）：Buddy（CN）/ BuddyAI（Intl）共用执行内核
+        let view = WbView::new(state, buddy_ai);
+        run_wb_stream(&view, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard, &encoded, &fallback);
+    });
+
+    let stream = ReceiverStream::new(rx);
+    Response::builder()
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("connection", "keep-alive")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("internal server error"))
+                .unwrap()
+        })
+}
+
+/// 伪流式入口（issue #213 P0/S5）：客户端 stream:true 时内部走聚合管线
+/// （wb_aggregate_core，断流/空完成全可无损换号重试），成功后按 proto 合成
+/// SSE 下发；本池耗尽走跨池兜底移交（无 fallback / 移交失败则按 proto 发错误
+/// 帧收尾）。签名与 wb_stream_chat 同构。
+#[allow(clippy::too_many_arguments)]
+pub fn wb_pseudo_stream(
+    state: Arc<ApiSharedState>,
+    buddy_ai: bool,
+    body_vec: Vec<u8>,
+    model: String,
+    start_ts: Instant,
+    proto: Protocol,
+    key_id: String,
+    guard: InflightGuard,
+    encoded: HashSet<String>,
+    fallback: Vec<super::dispatch::PoolCandidate>,
+) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+    // 聚合含分级重试退避（RetrySame sleep 最长 60s×N），对齐 wb_aggregate_chat
+    // 迁入 stream_runtime 专用阻塞池（防饿死主池鉴权等短任务）
+    super::stream_runtime().spawn_blocking(move || {
+        // inflight guard 随后台任务存续至流结束（§4.5，客户端断连由 Drop 兜底）
+        let chat_id = match proto {
+            Protocol::OpenAi => format!("chatcmpl-{}", now_ts()),
+            Protocol::OpenAiText => format!("cmpl-{}", now_ts()),
+            Protocol::Anthropic => format!("msg_{}", now_ts()),
+            Protocol::Responses => format!("resp_{}", now_ts()),
+        };
+
+        // keep-alive ticker：wb_stream_chat 同款 watch + DoneSignal 范式；间隔取
+        // pseudo_keepalive_secs（默认 5s，比流式 15s 更激进防 idle 回收；0 = 关闭）
+        let keepalive_secs = state
+            .pseudo_keepalive_secs
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // DoneSignal 必须声明在 if 块外、活到闭包结束（聚合全程）：其 Drop 才
+        // 发出 done 信号令 ticker 退出。若写在 if 内，块结束即析构 →
+        // done_rx.changed() 立即返回 → keep-alive ticker 空转即亡，聚合期间
+        // 再也发不出保活帧（审查修复：对齐 wb_stream_chat 的作用域范式）
+        let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
+        let _done = super::routes::DoneSignal(done_tx);
+        if keepalive_secs > 0 {
+            let tx2 = tx.clone();
+            tokio::spawn(async move {
+                let mut tick =
+                    tokio::time::interval(std::time::Duration::from_secs(keepalive_secs));
+                tick.tick().await; // 首个 tick 立即返回，跳过
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            if tx2
+                                .send(Ok(bytes::Bytes::from(": keep-alive\n\n")))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        // 主任务已结束：ticker 退出，放行流终结
+                        _ = done_rx.changed() => break,
+                    }
+                }
+            });
+        }
+
+        // wb 族池视图（§3.2）：Buddy（CN）/ BuddyAI（Intl）共用执行内核；
+        // Sse sink 成功就地合成下发，耗尽/Fatal 均内核内错误帧收尾（Json sink
+        // 的 Fatal Err 由 wb_aggregate_chat 外层映射 HTTP 错误响应）
+        // Err 仅 Fatal 会抵达（成功/耗尽/移交均已就地收尾或发帧）——Sse 出口已在
+        // 内核内发帧，此处无需再处理
+        let _ = wb_aggregate_core(
+            state,
+            buddy_ai,
+            body_vec,
+            model,
+            true, // 伪流式对外是流，记账 is_stream 口径与流式路径一致
+            start_ts,
+            key_id,
+            guard,
+            encoded,
+            fallback,
+            AggregateSink::Sse { tx, proto, chat_id },
+        );
+    });
+
+    let stream = ReceiverStream::new(rx);
+    Response::builder()
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("connection", "keep-alive")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("internal server error"))
+                .unwrap()
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_wb_stream(
+    state: &WbView,
+    body_vec: &[u8],
+    model: &str,
+    proto: Protocol,
+    key_id: &str,
+    chat_id: &str,
+    tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    start_ts: Instant,
+    mut guard: InflightGuard,
+    encoded: &std::collections::HashSet<String>,
+    fallback: &[super::dispatch::PoolCandidate],
+) {
+    // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
+    let key_name = super::api_keys::key_name_for(&state.data_dir, key_id);
+    // issue #138 P0：peek DOM 用完即弃——块内一次性提取 sticky/longctx 提示与
+    // effort 后立即释放，不再存活整条流（大 body 下 DOM 放大 3~6 倍）
+    let (sticky_key, effort_hint) = {
+        let peek: Value = serde_json::from_slice(body_vec).unwrap_or(json!({}));
+        // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
+        log_longctx_hint(state, &peek, model);
+        (
+            SessionKey::from_body(&peek),
+            peek.get("reasoning_effort").and_then(|v| v.as_str()).map(str::to_string),
+        )
+    };
+    let templates = load_templates(state);
+    // 工具名别名表（issue #150 接线）：WB 族池（Buddy CN / BuddyAI Intl）此前只接
+    // 身份声明清洗、未接工具名改写——上游按 tools 工具名集合识别 agent 客户端时，
+    // 洗干净的 system 仍配原名工具集即被 11128 拒（网关日志「指纹样本」实证：system=""
+    // 而 tools=[ask_user_question,create_goal,...] 全为原名）。与 Trae/Qoder 池同表
+    // 复用 kv `tool_alias_map`（工具集指纹是上游风控家族共性，分档无收益）。
+    let tool_alias_rules = load_tool_alias_rules(state);
+    // 本次请求命中流水游标（issue #195 方案 B5）：请求首个 prepare 前取快照，
+    // 11128 Fatal 落样本时导出之后的命中清单——样本行附带「本次实际命中」
+    // 而非进程级累计值
+    let hit_cursor = wb_payload::template_hits_mark();
+    let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
+
+    // F-35 子 Key 约束：限定上游 + 专一/临期优先（匿名/无约束 Key 全空 → 走默认调度）。
+    // issue #25 资源池绑定：仅当 Key 约束作用域含 buddy 池时应用（绑定 trae 的
+    // Key 白名单指 Trae 账号，不得误过滤 WB 池）。
+    // issue #30 混合白名单：按前缀作用域提取 Buddy 条目（空集 = 排除，不得过滤）
+    let (allowed_set, dedicated) = super::api_keys::constraints_for(&state.data_dir, key_id)
+        .and_then(|k| k.pool_constraints(state.pool_label()))
+        .map_or((None, None), |c| (c.allowed, c.dedicated));
+
+    // 粘性首轮：命中绑定且账号 healthy → 锁定账号与上游会话（双段分配）；
+    // 子 Key 限定上游不含粘性账号时忽略粘性；
+    // issue #206：粘性账号对该模型冷却中同样不锁定（绑定是路由优化不是
+    // 强制，冷却期正常让位走轮换，防 429 期间固定打同一账号）
+    let sticky0: Option<(String, String)> = state
+        .sticky_resolve(&sticky_key, now_ts())
+        .and_then(|b| {
+            if allowed_set.as_ref().map_or(false, |a| !a.contains(&b.uid)) {
+                return None;
+            }
+            // issue #206：粘性账号对模型冷却中 → 放弃绑定（冷却让位语义）
+            if account_model_cooling_remaining(state, &b.uid, model).is_some() {
+                return None;
+            }
+            state
+                .route_pool()
+                .pick_by_uid(&b.uid, false)
+                .map(|_| (b.uid, b.conv_id))
+        });
+    let sticky_uid: Option<String> = sticky0.as_ref().map(|(u, _)| u.clone());
+    let sticky_conv: String = sticky0
+        .as_ref()
+        .map(|(_, c)| c.clone())
+        .unwrap_or_default();
+    // 首选：粘性 > 专一绑定 > 调度策略（F-77④：粘性账号 busy 且有空闲候选时让位）
+    let mut first_pick: Option<PickedAccount> = sticky0
+        .as_ref()
+        .and_then(|(u, _)| {
+            state
+                .route_pool()
+                .pick_sticky_yield(u, allowed_set.as_ref(), false)
+                .map(|(p, ev)| {
+                    if let Some(ev) = ev {
+                        state.logger.log_sched_event(&ev);
+                    }
+                    p
+                })
+        })
+        .or_else(|| {
+            // issue #206：专一绑定同样按账号×模型冷却过滤（冷却中视为不可用，
+            // 交由常规调度让位给其他账号）
+            let uid = dedicated.as_deref()?;
+            if account_model_cooling_remaining(state, uid, model).is_some() {
+                return None;
+            }
+            state.route_pool().pick_by_uid(uid, false)
+        });
+
+    let mut tried: HashSet<String> = HashSet::new();
+    let mut refreshed: HashSet<String> = HashSet::new(); // 401 刷新每账号一次
+    // issue #213 阶段2 审查修复：预算累计计数器——重开轮换会把 tried 中非冷却
+    // 账号移出（tried.len() 回落到池账号数），用 tried.len() 判预算会归零导致
+    // 无限轮换（cut/空完成不冷却时 budget 永不耗尽）。改为 insert 累加、耗尽
+    // 判定用累计值，跨轮不重置（口径 =「累计发起过上游请求的账号次数」）。
+    let mut budget_used: u32 = 0;
+    let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
+    // PR #162：传输掐断计数——全池被掐时耗尽收尾改报传输掐断而非误报无健康账号
+    let mut cut_hits: usize = 0;
+    let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
+    let mut last_residual_note: Option<String> = None; // 残指纹自检按请求去重（issue #122 C3）
+    // issue #195：11128 激进升级按请求一次。wb_sanitize 默认开时首轮已带默认
+    // 清洗，旧守卫 `!sanitize` 使升级分支永不进入 → 首轮 11128 直接 Fatal，
+    // 激进规则（兜未知指纹变体的唯一防线）形同虚设
+    let mut aggressive_tried = false;
+    // 审查修复（L1）：最近绑定账号（绑定成功才更新）——外层断连终局归因复用，
+    // 防换号重试期间断连落 "none" 致账单排查失据
+    let mut last_bound_uid: Option<String> = None;
+
+    loop {
+        // 客户端断连检测：通道关闭即终止轮换/重试，不再占用账号并发槽（对齐 routes.rs stream_chat）。
+        // 审查 M5：断连也是请求终局，补记一行失败用量（未取号 → "none"，与下方
+        // 轮换耗尽收尾同口径），防用量页 requests 缺口
+        if tx.is_closed() {
+            let duration_ms = start_ts.elapsed().as_millis() as u64;
+            // 审查修复（L1）：归因复用最近绑定账号（从未绑定才落 "none"）
+            let uid = last_bound_uid.as_deref().unwrap_or("none");
+            state.record_usage_bucket(state.usage_bucket(), model, uid, key_id, false, true, duration_ms, 0, 0);
+            return;
+        }
+        // ── 取号：粘性/专一命中优先，否则按 Key 约束 + 调度策略；换号后仅走策略 ──
+        let picked = match first_pick.take() {
+            Some(p) => p,
+            None => match state.route_pool().pick_excluding_constrained_ev_matching(
+                &tried,
+                allowed_set.as_ref(),
+                dedicated.as_deref(),
+                false,
+                // issue #206：账号×模型冷却过滤——SoftRate 429 对某账号某模型
+                // 冷却后，该账号在其他模型仍可用
+                &|uid| account_model_cooling_remaining(state, uid, model).is_none(),
+            ) {
+                Some((p, ev)) => {
+                    // F-77⑤ 可观测：busy_yield / busy_fallback 调度事件
+                    if let Some(ev) = ev {
+                        state.logger.log_sched_event(&ev);
+                    }
+                    p
+                }
+                None => {
+                    // issue #213 阶段2：预算重开轮换——tried 耗尽且未达 budget 时
+                    // 清空非冷却账号 + 抖动退避后重开（0 = 旧行为，直接落收尾）
+                    let budget = state.retry_budget(state.buddy_ai);
+                    let rounds = budget_used;
+                    if let Some(new_tried) = budget_retry_round(state, &tried, model, rounds, budget) {
+                        let round = rounds / state.route_pool().count().max(1) as u32;
+                        let delay = budget_backoff_ms(round.max(1));
+                        state.logger.log_sched_event(&format!(
+                            "retry budget 重开轮换 round={}/budget={} 退避 {}ms pool={}",
+                            round.max(1),
+                            budget,
+                            delay,
+                            state.pool_label(),
+                        ));
+                        std::thread::sleep(std::time::Duration::from_millis(delay));
+                        // 退避期间客户端离开 → 不再烧重开轮次（对齐轮换入口断连检测）
+                        if tx.is_closed() {
+                            state.record_usage_bucket(state.usage_bucket(), model, "none", key_id, false, true, start_ts.elapsed().as_millis() as u64, 0, 0);
+                            return;
+                        }
+                        tried = new_tried;
+                        continue;
+                    }
+                    let duration_ms = start_ts.elapsed().as_millis() as u64;
+                    // 审查 P2：轮换耗尽收尾对齐 routes.rs（issue #57 可观测）——
+                    // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
+                    // wb_template_map.json），否则维持原文案；code 保持 no_healthy_account
+                    let (healthy_total, _) = state.route_pool().selectable_stats_in(None, false);
+                    let (hard_credit_cnt, _) = state.route_pool().hard_credit_stats();
+                    let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message_with_transport_cut(
+                        state.pool_label(),
+                        empty_hits,
+                        tried.len(),
+                        healthy_total,
+                        hard_credit_cnt,
+                        cut_hits,
+                    );
+                    // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导（指纹拦截）
+                    // 才标记，TTL 内同池新请求直接激进起步，不再从零试探烧账号
+                    super::wb_payload::mark_channel_fp_block(
+                        state.pool_label(),
+                        exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK",
+                    );
+                    state.logger.log_request(
+                        state.pool_label(), "POST", "/v2/chat/completions", model, true, 503, "none",
+                        duration_ms, &key_name, "",
+                        Some(&exhaust_msg),
+                    );
+                    let diag = state.route_pool().diagnose();
+                    let diag_summary: Vec<String> = diag
+                        .iter()
+                        .map(|d| format!("{}({})", d.name, d.reason))
+                        .collect();
+                    // issue #99 ① + #125 增强：影子风控收尾采样入内存环形缓冲
+                    // （kind=empty，样本 = 清洗前原始请求体），返回日志注记供反查
+                    let sample_note =
+                        wb_payload::empty_sample_note(&exhaust_tag, state.pool_label(), body_vec);
+                    // main 审查 #8 修正：本行是 diag_summary（逐账号不可用原因）在
+                    // wb 路径的唯一落点——上方 log_request 的 exhaust_msg 仅含聚合计
+                    // 数与归因语义、不含 reasons，故整行保持无条件落账，不随指纹样本
+                    // 一并门控（qoder 路径行不含 reasons，其门控口径不受影响）
+                    state.logger.log_debug_line(format!(
+                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} cut_hits={} pool={} reasons=[{}]{}",
+                        tried.len(),
+                        empty_hits,
+                        cut_hits,
+                        state.pool_label(),
+                        diag_summary.join(", "),
+                        sample_note,
+                    ));
+                    // 按客户端协议分流错误帧（main 审查 #7，对齐 qoder 客户端口径）：
+                    // Anthropic 收 event: error、Responses 收 response.failed、OpenAI
+                    // 系维持 data: 帧——统一走 send_stream_error_wb（docker 侧加固
+                    // 同款：Anthropic 合成收口、Responses 复用 responses_object 骨架）；
+                    // message 均为 exhaust_msg，code 保持字符串 no_healthy_account
+                    // 客户端兼容（main 口径）
+                    // F-81 跨池移交：有健康候选链且客户端未断连 → 把剩余流生命
+                    // 周期交给下一池（guard move；503 账面行保留=本池尝试记录；
+                    // 移交成功不再发错误帧）；链空或全不支持 → 原收尾。
+                    // 审查 A-1：usage 行后置到移交失败之后——移交成功由接收池落
+                    // 终态用量（含真实账号），本池不再补 "none" 行，避免同一请求
+                    // 两条用量行（双记账）
+                    if !fallback.is_empty() && !tx.is_closed() {
+                        if super::cross_pool::continue_stream_on_next_pool(&state.state, state.pool_label(), fallback, body_vec, proto, key_id, chat_id, tx, guard, encoded, start_ts) {
+                            return;
+                        }
+                    }
+                    state.record_usage_bucket(state.usage_bucket(), model, "none", key_id, false, true, duration_ms, 0, 0);
+                    send_stream_error_wb(tx, proto, model, json!("no_healthy_account"), &exhaust_msg);
+                    return;
+                }
+            },
+        };
+        tried.insert(picked.uid.clone());
+        budget_used += 1; // 预算累计计数（重开轮换不清零，见声明处注释）
+        // F-77 账号级在途计数：取号即绑定（重试换号时 bind_account 自动解绑旧账号）。
+        // 审查 P1-4 TOCTOU 收紧：普通候选 CAS 复核「在途 < 并发上限」，已满则
+        // 不发起请求换下一候选（不计错误不冷却）；over_limit 候选（专一/粘性
+        // 锁定、busy_fallback 降级）保留原无条件绑定语义。
+        // active_uid 仅在绑定成功后更新（CAS 拒绝的候选不得污染「当前账号」展示）
+        let bound = if picked.over_limit {
+            guard = guard.bind_account(state.route_pool().inflight_handle(&picked.uid));
+            true
+        } else {
+            guard.bind_account_cas(
+                state.route_pool().inflight_handle(&picked.uid),
+                state.route_pool().concurrency_limit(),
+            )
+        };
+        if !bound {
+            continue;
+        }
+        // 审查修复（L1）：绑定成功才更新「最近绑定账号」（CAS 拒绝的候选不算）
+        last_bound_uid = Some(picked.uid.clone());
+        *safe_lock(&state.active_uid) = Some(picked.uid.clone());
+
+        // 上游会话 id：粘性命中复用，否则新生成（成功后绑定）
+        let is_sticky_hit = sticky_uid.as_deref() == Some(picked.uid.as_str()) && !sticky_conv.is_empty();
+        let conv_id = if is_sticky_hit {
+            sticky_conv.clone()
+        } else {
+            gen_conv_id()
+        };
+
+        let catalog = super::wb_catalog::load(&state.data_dir);
+        let effort = super::wb_catalog::find(&catalog, model)
+            .and_then(|m| m.resolve_effort(effort_hint.as_deref()));
+        // 多候选改写种子（issue #122 方案 C1）：conv_id 绑定请求、tried.len()
+        // 随换号轮换递增——跨重试候选必变；空完成后（empty_hits>0）或池级指纹
+        // 拦截 TTL 内（issue #122 缺口2）追加激进清洗（issue #122 方案 C2）；
+        // 本请求内已 11128 升级（aggressive_tried，issue #195）后换号也保持激进——
+        // 新号重建请求体若回退默认表，指纹回归必再 11128（对齐 toolexec force_aggressive 口径）
+        let seed = wb_payload::variant_seed(&conv_id, tried.len() as u64);
+        let mut converted = wb_payload::prepare_wb_chat_body(
+            body_vec, model, &picked.uid, &conv_id, effort.as_deref(), sanitize, &templates,
+            seed, empty_hits > 0 || aggressive_tried || wb_payload::fp_block_recent(state.pool_label()),
+        );
+        // 工具别名正向改写（issue #150）：受 sanitize 门控（与 Trae/Qoder 池同口径）；
+        // 逆映射供响应侧回改（覆盖 tools/tool_choice/历史 tool_calls 三个透传点，
+        // 零命中 None 直通）。改写改变 JSON 长度，故入参为 &mut Vec<u8> 整体替换
+        let mut tool_alias: Option<std::collections::HashMap<String, String>> = None;
+        if sanitize {
+            tool_alias =
+                wb_payload::apply_tool_alias_forward(&mut converted, &tool_alias_rules);
+        }
+        // 残指纹自检（issue #122 方案 C3）：改写后首条 system 仍命中已知特征词
+        // → debug 日志（按请求去重），提示模板表需经 UI「指纹清洗」tab 热更新
+        if sanitize {
+            if let Some(note) =
+                wb_payload::residual_fingerprint_note_rules_bytes(&converted, &tool_alias_rules)
+            {
+                if last_residual_note.as_deref() != Some(note.as_str()) {
+                    last_residual_note = Some(note.clone());
+                    state.logger.log_debug_line(format!(
+                        "[DEBUG] 残指纹自检命中: {note} pool={} uid={}",
+                        state.pool_label(),
+                        picked.uid
+                    ));
+                }
+            }
+        }
+        let mut creds = WbCreds {
+            id: picked.uid.clone(),
+            uid: picked.uid.clone(),
+            name: String::new(),
+            token: picked.jwt.clone(),
+            domain: picked.domain.clone(),
+            enterprise_id: picked.enterprise_id.clone(),
+            global_region: picked.global_region,
+        };
+
+        let mut same_attempt: u32 = 0;
+        loop {
+            // 客户端断连检测：重试等待/长路径期间离开则终止（同账号 guard 随 Drop 释放）。
+            // 审查 M5：断连为请求终局，补记一行失败用量（已绑定 picked 账号）
+            if tx.is_closed() {
+                let duration_ms = start_ts.elapsed().as_millis() as u64;
+                state.record_usage_bucket(state.usage_bucket(), model, &picked.uid, key_id, false, true, duration_ms, 0, 0);
+                return;
+            }
+            let ttfb_start = Instant::now();
+            match wb_upstream::make_wb_request(&creds, &conv_id, &converted) {
+                Ok(reader) => {
+                    // 首字超时 10s（T2.7/F-34）：超时视为上游故障 → 换号；
+                    // F-76③ 慢请求竞速对冲：首字超阈值时向第二账号发对冲请求，
+                    // 先出首字者胜（对冲关闭时与纯首字超时语义一致）
+                    let mut win = match race_first_byte(
+                        state,
+                        &picked.uid,
+                        &conv_id,
+                        model,
+                        &converted,
+                        reader,
+                        &tried,
+                        allowed_set.as_ref(),
+                        dedicated.as_deref(),
+                    ) {
+                        Ok(w) => w,
+                        Err(()) => {
+                            state.route_pool().note_error(&picked.uid, ErrKind::Server);
+                            note_model_failure(state, model);
+                            break;
+                        }
+                    };
+                    let ttfb_ms = ttfb_start.elapsed().as_millis() as u64;
+                    // 对冲计数落定 + guard 重绑（接管时生效账号 = 对冲账号）
+                    guard = settle_hedge(state, &mut win, guard, &picked.uid);
+                    let win_uid = win.uid.as_str();
+                    // 竞速胜者行源（Box 迭代器）桥接为可中断行源：stream_forward_ex
+                    // 停滞期间周期性检查断连（转发线程复用；语义与既有 ttfb 包装一致）
+                    let win_lines = super::wb_upstream::InterruptibleLines::from_iterator(
+                        Box::new(win.lines) as Box<dyn Iterator<Item = String> + Send>,
+                    );
+                    let (error_info, sent_any, failed_inline, usage) =
+                        wb_sse::stream_forward_ex(win_lines, tx, proto, chat_id, model, encoded, tool_alias.as_ref());
+                    // P2-2：竞速桥接行源的读错误在共享槽（wb_sse 只见桥 EOF）——
+                    // 合并为传输掐断哨兵，按账号无关故障处置
+                    let error_info = merge_transport_cut_info(error_info, &win.read_slot);
+                    let duration_ms = start_ts.elapsed().as_millis() as u64;
+                    {
+                        // 宽口径提取（别名 + 字符串数字形态，审查 P2）
+                        let (pt, ct) = usage.as_ref().map(u64_pair).unwrap_or((0, 0));
+                        // F-76① TTFT 入账：用量页 P50/P95/TTFT 分位统计。
+                        // 每请求终态单行（审查问题6）：换号重试（空完成未流出 /
+                        // 错误未流出，对应下方两处 break）为中间态不落账，避免
+                        // requests 虚高；终态（成功 / 就地收尾 / 流内失败透传）恰落一行
+                        if !(error_info.is_some() && !sent_any) {
+                            // M4 审查修复：缓存读 tokens 旁路入账（宽口径别名提取；
+                            // 上游未下发得 0 不入账，与 credits「不得伪造」口径一致）
+                            state.record_usage_cached(
+                                state.usage_bucket(),
+                                usage.as_ref().map(cached_tokens_of).unwrap_or(0),
+                            );
+                            // 分桶修复（审查 P1）：按 route_pool 实际桶入账——原写死
+                            // is_wb=true，buddy-ai 流式成功请求全部误入 wb_days 桶
+                            //（国内 Buddy 看板虚高、buddy_ai_days 只剩失败行，积分看板失真）
+                            state.record_usage_bucket_ttfb(
+                                state.usage_bucket(), model, win_uid, key_id,
+                                error_info.is_none() && !failed_inline,
+                                true, duration_ms, pt, ct, Some(ttfb_ms),
+                            );
+                        }
+                    }
+                    match error_info {
+                        Some((code, msg)) => {
+                            if super::is_transport_cut(code, &msg) {
+                                // 传输层掐断（issue #158 P2-2，与 Trae 池 sse.rs 同口径）：
+                                // 账号无关的传输故障——不冷却、不解绑粘性、不计空完成
+                                // 指纹。未流出 → 换号（收尾帧未发）；已流出 → 就地收尾
+                                // （终止帧已由 stream_forward_ex EOF-with-content 分支
+                                // 补发，客户端看到完整流），上方通用记账块已落失败行
+                                if sent_any {
+                                    state.logger.log_request_ttfb(
+                                        state.pool_label(), "POST", "/v2/chat/completions", model, true, 200, win_uid,
+                                        duration_ms, Some(ttfb_ms), &key_name,
+                                        &state.route_pool().name_of(win_uid), Some(&msg),
+                                    );
+                                    return;
+                                }
+                                // PR #162：cut_hits 计入轮换耗尽归因——全池被掐时
+                                // exhaust_message_with_transport_cut 报传输掐断而非
+                                // 误报 "no healthy account available"（与 trae 池同口径）
+                                cut_hits += 1;
+                                break;
+                            }
+                            if super::is_empty_completion(code, &msg) {
+                                // sent_any 护栏（对齐 qoder_route）：内容已流出时换号重发
+                                // 会向同一 SSE 流拼接第二份完整响应 → 就地收尾不再重试
+                                if sent_any {
+                                    state.logger.log_request_ttfb(
+                                        state.pool_label(), "POST", "/v2/chat/completions", model, true, 200, win_uid,
+                                        duration_ms, Some(ttfb_ms), &key_name,
+                                        &state.route_pool().name_of(win_uid), Some("空完成（内容已流出）→ 就地收尾"),
+                                    );
+                                    return;
+                                }
+                                // 空完成（影子风控/上游异常，issue #57）：不冷却、不透传、
+                                // 不绑定粘性，换号重试（收尾帧未发，重试流可续传）
+                                empty_hits += 1;
+                                state.logger.log_request_ttfb(
+                                    state.pool_label(), "POST", "/v2/chat/completions", model, true, 200, win_uid,
+                                    duration_ms, Some(ttfb_ms), &key_name,
+                                    &state.route_pool().name_of(win_uid), Some(&format!("空完成 → 换号重试{}", wb_payload::template_hit_note())),
+                                );
+                                break;
+                            }
+                            // 11128 流内形态（issue #123）：渠道风控以 HTTP 200 +
+                            // SSE 错误帧下发时此前无处置——短冷却换号、无日志、
+                            // 无指纹样本，诊断闭环断裂。口径同下方 Err 分支：
+                            // 未清洗 → 强制清洗同号重试一次；已清洗仍命中 →
+                            // 落指纹样本后换号（不冷却：指纹拦截与账号无关）
+                            if code == 11128 || super::retry::is_illegal_channel_error(&msg) {
+                                // sent_any 护栏（审查修复，对齐上方空完成分支）：内容已
+                                // 流出时同号重试会向同一 SSE 流拼接第二份完整响应 →
+                                // 未清洗也不得重试，直接落下方 Fatal 终局
+                                // issue #195：升级守卫改为按请求一次性旗标——wb_sanitize
+                                // 默认开时旧守卫 `!sanitize` 恒假，激进规则永不生效。
+                                // 现无论开关状态，11128 后先做一次默认表+激进规则全力
+                                // 清洗的同号重试（prepare 末参 aggressive=true 已是首轮
+                                // 超集），再命中才 Fatal
+                                if !aggressive_tried && !sent_any {
+                                    aggressive_tried = true;
+                                    sanitize = true;
+                                    state.logger.log_sched_event(&format!(
+                                        "11128 强制清洗重试（流内）{}", wb_payload::template_hit_note()
+                                    ));
+                                    converted = wb_payload::prepare_wb_chat_body(
+                                        body_vec, model, &picked.uid, &conv_id, effort.as_deref(),
+                                        true, &templates, seed, true,
+                                    );
+                                    // 重建后须重做工具别名（issue #150）：prepare 产物是
+                                    // 原名工具集，不重做即逆映射失配且指纹未消除
+                                    tool_alias = wb_payload::apply_tool_alias_forward(
+                                        &mut converted, &tool_alias_rules,
+                                    );
+                                    std::thread::sleep(std::time::Duration::from_millis(200));
+                                    // 断连检测：重试等待期间客户端离开则终止
+                                    if tx.is_closed() {
+                                        let duration_ms = start_ts.elapsed().as_millis() as u64;
+                                        // 记账（审查修复）：归因统一 win_uid——接管时该
+                                        // 失败流属于对冲胜者，与下方 Fatal 分支口径一致
+                                        state.record_usage_bucket(state.usage_bucket(), model, win_uid, key_id, false, true, duration_ms, 0, 0);
+                                        return;
+                                    }
+                                    continue; // 内层 attempt loop：同号重试
+                                }
+                                // Fatal 终局：样本按请求最多落一次（落完即 return，
+                                // 无需按请求去重）
+                                let sample = wb_payload::fingerprint_sample(body_vec);
+                                // 归因探针须用胜者凭证：对冲胜出时 win_uid 可能 ≠
+                                // picked.uid，而 creds 是按 picked 构造的——用 picked
+                                // 凭证探针会把账号/池标记归因到未参与本次失败请求的
+                                // 账号（审查修复）。胜者 ≠ picked 时放弃探针（宁缺勿错）
+                                let probe = if win_uid == picked.uid {
+                                    Some((&creds, model))
+                                } else {
+                                    None
+                                };
+                                log_and_record_11128(
+                                    state, &sample, &converted, &tool_alias_rules, hit_cursor,
+                                    probe,
+                                );
+                                // 终局说明（审查修复：区分两种不可重试情形——清洗后
+                                // 仍命中=模板需更新；内容已流出=不可同号重试）
+                                if sanitize {
+                                    state.logger.log_sched_event(
+                                        "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
+                                    );
+                                } else {
+                                    state.logger.log_sched_event(
+                                        "11128 流内命中且内容已流出：不可同号重试（避免拼接第二份响应），就地终局",
+                                    );
+                                }
+                                // 已清洗仍命中：指纹拦截与账号无关，换号必再命中
+                                //（issue #57 口径）——Fatal 终局，同上方 HTTP-Err Fatal
+                                let fatal_msg = format!("upstream 400 error: 11128 {}", msg);
+                                // 记账（审查修复）：仅未流出（sent_any=false，通用记账
+                                // 块跳过）时补账——已流出时通用块已落终态行，再补即
+                                // requests 重复虚高。归因统一 win_uid（对冲胜者可能与
+                                // picked 不一致，与下方日志口径一致）
+                                if !sent_any {
+                                    state.record_usage_bucket(state.usage_bucket(), model, win_uid, key_id, false, true, duration_ms, 0, 0);
+                                }
+                                state.logger.log_request_ttfb(
+                                    state.pool_label(), "POST", "/v2/chat/completions", model, true, 400, win_uid,
+                                    duration_ms, Some(ttfb_ms), &key_name,
+                                    &state.route_pool().name_of(win_uid), Some(&fatal_msg),
+                                );
+                                send_stream_error_wb(tx, proto, model, json!(400), &fatal_msg);
+                                return;
+                            }
+                            let kind = classify_wb_error(code, &msg);
+                            if kind != ErrKind::None {
+                                // issue #206：SoftRate 记账号×模型冷却对（不钉账号级
+                                // until）；其余类别维持既有账号级/模型级分账（issue #159）
+                                note_wb_error(state, win_uid, model, kind, Some(&msg), None);
+                                *safe_lock(&state.last_error) =
+                                    Some(format!("wb uid={} code={} msg={}", win_uid, code, msg));
+                            }
+                            if !sent_any {
+                                // 流未开始：错误不下发，允许换号重试
+                                break;
+                            }
+                            state.logger.log_request_ttfb(
+                                state.pool_label(), "POST", "/v2/chat/completions", model, true, 200, win_uid,
+                                duration_ms, Some(ttfb_ms), &key_name,
+                                &state.route_pool().name_of(win_uid), Some(&msg),
+                            );
+                            return; // 已有数据流出：就地收尾
+                        }
+                        None => {
+                            if failed_inline {
+                                // 流内失败已就地透传客户端（response.failed / error 事件
+                                // 已下发）：不重试、不 note_success、不清模型冷却、不绑定
+                                // 粘性会话；亦不 note_error——错误已原样给到客户端，内容类
+                                // 失败计入冷却会造成账号过度冷却
+                                state.logger.log_request_ttfb(
+                                    state.pool_label(), "POST", "/v2/chat/completions", model, true, 200, win_uid,
+                                    duration_ms, Some(ttfb_ms), &key_name,
+                                    &state.route_pool().name_of(win_uid), Some("流内失败已透传客户端"),
+                                );
+                                return;
+                            }
+                            state.route_pool().note_success(win_uid);
+                            clear_model_failure(state, model);
+                            // issue #206：成功请求解除该账号×该模型的冷却对
+                            clear_account_model_cooldown(state, win_uid, model);
+                            // 绑定粘性会话（Mutex 内 re-check 防 TOCTOU）
+                            state.sticky_bind(&sticky_key, win_uid, &conv_id, now_ts());
+                            state.route_sticky().save(&state.data_dir);
+                            state.logger.log_request_ttfb(
+                                state.pool_label(), "POST", "/v2/chat/completions", model, true, 200, win_uid,
+                                duration_ms, Some(ttfb_ms), &key_name,
+                                &state.route_pool().name_of(win_uid), None,
+                            );
+                            return;
+                        }
+                    }
+                }
+                Err((status, resp_body, retry_after)) => {
+                    // 11128 渠道风控（issue #57）：按请求指纹拦截、与账号/模型无关，
+                    // 换号无意义。清洗未启用时强制清洗后同号重试一次；已清洗仍命中
+                    // → 走下方 retry_plan 原样 Fatal（需更新 wb_template_map.json）
+                    if status == 400 && super::retry::is_illegal_channel_error(&resp_body) {
+                        // issue #195：升级守卫改为按请求一次性旗标（口径同流内分支）
+                        if !aggressive_tried {
+                            aggressive_tried = true;
+                            sanitize = true;
+                            state.logger.log_sched_event(&format!(
+                                "11128 强制清洗重试{}", wb_payload::template_hit_note()
+                            ));
+                            // aggressive=true（issue #122 缺口3）：11128 是显式指纹
+                            // 确认，强制清洗即全力清洗（激进规则一并生效）
+                            converted = wb_payload::prepare_wb_chat_body(
+                                body_vec, model, &picked.uid, &conv_id, effort.as_deref(), true, &templates,
+                                seed, true,
+                            );
+                            // 重建后须重做工具别名（issue #150）：与流内形态同口径
+                            tool_alias = wb_payload::apply_tool_alias_forward(
+                                &mut converted, &tool_alias_rules,
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                            // 断连检测：重试等待期间客户端离开则终止（审查 M5：补记失败终态用量）
+                            if tx.is_closed() {
+                                let duration_ms = start_ts.elapsed().as_millis() as u64;
+                                state.record_usage_bucket(state.usage_bucket(), model, &picked.uid, key_id, false, true, duration_ms, 0, 0);
+                                return;
+                            }
+                            continue;
+                        }
+                        // 清洗已启用仍命中（issue #99 诊断闭环）：落原始指纹样本 +
+                        // 模板命中注记，差集即漏网触发句 → UI「指纹清洗」tab 热更新；
+                        // 按请求去重（换号轮换重复命中样本恒定，不重复打样）
+                        let sample = wb_payload::fingerprint_sample(body_vec);
+                        if last_11128_sample.as_deref() != Some(sample.as_str()) {
+                            last_11128_sample = Some(sample.clone());
+                            log_and_record_11128(
+                                state, &sample, &converted, &tool_alias_rules, hit_cursor,
+                                Some((&creds, model)),
+                            );
+                            // Fatal 透传前的排查指引（仅日志，客户端响应体不变）
+                            state.logger.log_sched_event(
+                                "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
+                            );
+                        }
+                    }
+                    // 分级重试策略表（T2.2/F-33 v1.2）
+                    match retry_plan(status, &resp_body, same_attempt, retry_after) {
+                        RetryAction::RetrySame { delay_ms } => {
+                            same_attempt += 1;
+                            std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(60_000)));
+                            // 断连检测：重试等待期间客户端离开则终止，不再占用该账号并发槽
+                            // （审查 M5：补记失败终态用量）
+                            if tx.is_closed() {
+                                let duration_ms = start_ts.elapsed().as_millis() as u64;
+                                state.record_usage_bucket(state.usage_bucket(), model, &picked.uid, key_id, false, true, duration_ms, 0, 0);
+                                return;
+                            }
+                            continue;
+                        }
+                        RetryAction::SwitchKey => {
+                            // T2.6：401 → 刷新一次凭证后同号重试（每账号每请求一次）
+                            if status == 401 && !refreshed.contains(&picked.uid) {
+                                refreshed.insert(picked.uid.clone());
+                                match wb_upstream::refresh_access_token_for(&state.data_dir, &picked.uid, Some(&creds.token), state.buddy_ai) {
+                                    Ok(new_token) => {
+                                        state.route_pool().update_jwt(&picked.uid, &new_token);
+                                        creds.token = new_token;
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        *safe_lock(&state.last_error) =
+                                            Some(format!("wb refresh uid={} err={}", picked.uid, e));
+                                        // 他方进程刷新中（≠真实刷新失败）：本轮直接换号，不走
+                                        // classify_error→note_error，防瞬时忙态误置 disabled；
+                                        // 对方刷新结果由下轮请求持锁双检/stale 对比复用
+                                        if e == wb_upstream::ERR_PEER_REFRESHING {
+                                            break;
+                                        }
+                                        // 审查修复（第五轮）：传输层瞬时失败（网络/响应异常，
+                                        // wb_upstream 统一以「刷新请求失败:」前缀返回，对应签到侧
+                                        // RefreshFail::Network）≠ 凭证级失效——同样换号不走
+                                        // classify，防一次网络抖动把健康账号 SessionDead 踢出轮转；
+                                        // 仅凭证级失效（刷新端点 HTTP 错误）才落下方 classify
+                                        if e.starts_with("刷新请求失败") {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            let kind = classify_wb_http_error(status, &resp_body);
+                            if kind != ErrKind::None {
+                                // issue #159：kind=None（4001 模型配置不匹配）不冷却，对齐流内路径；
+                                // issue #206：SoftRate 记账号×模型冷却对（不钉账号级 until）；
+                                // 其余类别维持既有账号级/模型级分账
+                                let upstream = upstream_msg(&resp_body);
+                                note_wb_error(state, &picked.uid, model, kind,
+                                    upstream.as_deref(), retry_after);
+                            }
+                            *safe_lock(&state.last_error) = Some(format!(
+                                "wb uid={} status={} body={}",
+                                picked.uid,
+                                status,
+                                safe_slice(&resp_body, 200)
+                            ));
+                            state.logger.log_request(
+                                state.pool_label(), "POST", "/v2/chat/completions", model, true, status, &picked.uid,
+                                start_ts.elapsed().as_millis() as u64,
+                                &key_name, &state.route_pool().name_of(&picked.uid),
+                                Some(&format!("upstream status={}", status)),
+                            );
+                            break; // 换号
+                        }
+                        RetryAction::Fatal => {
+                            let msg = format!("upstream {} error: {}", status, safe_slice(&resp_body, 300));
+                            // 终态记账对齐 SwitchKey/耗尽收尾（审查 F3）：Fatal 是请求
+                            // 终局，此前仅 log_request 导致用量统计页缺口
+                            state.record_usage_bucket(state.usage_bucket(), model, &picked.uid, key_id, false, true,
+                                start_ts.elapsed().as_millis() as u64, 0, 0);
+                            state.logger.log_request(
+                                state.pool_label(), "POST", "/v2/chat/completions", model, true, status, &picked.uid,
+                                start_ts.elapsed().as_millis() as u64,
+                                &key_name, &state.route_pool().name_of(&picked.uid),
+                                Some(&msg),
+                            );
+                            send_stream_error_wb(tx, proto, model, json!(status as i64), &msg);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ==================== 非流式（上游只回 SSE → 本地聚合） ====================
+
+pub async fn wb_aggregate_chat(
+    state: Arc<ApiSharedState>,
+    buddy_ai: bool,
+    body_vec: Vec<u8>,
+    model: String,
+    stream: bool,
+    start_ts: Instant,
+    proto: Protocol,
+    key_id: String,
+    guard: InflightGuard,
+    encoded: std::collections::HashSet<String>,
+) -> Response {
+    let model_out = model.clone();
+    let encoded_in = encoded.clone();
+    // P2 修复：聚合含分级重试（RetrySame 退避 std::thread::sleep 最长 60s×N），
+    // 长阻塞占主池会饿死鉴权等短任务，迁入 stream_runtime 专用阻塞池；
+    // issue #213 S3：执行管线抽为 wb_aggregate_core（JSON/SSE 双 sink 共用）
+    let result = super::stream_runtime()
+        .spawn_blocking(move || {
+            wb_aggregate_core(
+                state, buddy_ai, body_vec, model, stream, start_ts, key_id, guard, encoded_in,
+                // Json 出口恒传空 fallback 链（main 口径：跨池移交仅 Sse 出口接线）
+                Vec::new(),
+                AggregateSink::Json,
+            )
+        })
+        .await;
+
+    match result {
+        Ok(Ok(AggregateOutcome::Completion(resp))) => {
+            let body = match proto {
+                Protocol::Anthropic => wb_sse::completion_to_anthropic(
+                    &resp,
+                    &format!("msg_{}", now_ts()),
+                    &model_out,
+                    // tool_alias 传 None：resp 来自闭包内 wb_sse::aggregate（聚合
+                    // 时已传入 alias，流式收集阶段 rename_tool_back 已回改原名）；
+                    // 原名恰为回改映射键（用户配置链式别名规则）时二次回改会改坏
+                    // 工具名。与 qoder_route 聚合分支同口径（审查修复）
+                    None,
+                ),
+                Protocol::OpenAiText => wb_sse::completion_to_text(&resp, &model_out),
+                Protocol::Responses => super::wb_responses::completion_to_responses(
+                    &resp,
+                    &format!("resp_{}", now_ts()),
+                    &model_out,
+                    &encoded,
+                ),
+                Protocol::OpenAi => resp,
+            };
+            Response::builder()
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap_or_else(|_| internal_error_response())
+        }
+        Ok(Err(msg)) => {
+            // 审查修复：Fatal 错误透传上游状态码（对齐 SOLO 聚合路径 AggregateFail::Upstream）。
+            // 上游 400/404/413 等请求级错误此前被统一降级 503 no_healthy_account，
+            // 严格客户端（Codex/Claude Code）会按「可重试临时故障」无意义重试；
+            // 401/403/429 属账号/池问题，维持 503 语义（换号重试仍由池层决策）。
+            let upstream_status = msg
+                .strip_prefix("upstream ")
+                .and_then(|rest| rest.split(' ').next())
+                .and_then(|s| s.parse::<u16>().ok());
+            let status = match upstream_status {
+                Some(s) if (400..500).contains(&s) && !matches!(s, 401 | 403 | 429) => {
+                    StatusCode::from_u16(s).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
+                }
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            match proto {
+                Protocol::Anthropic => anthropic_error(status, "api_error", &msg),
+                _ => openai_error(status, "upstream_error", &msg),
+            }
+        }
+        // SseSent 仅 Sse sink（wb_pseudo_stream）会产出；本入口恒传 Json sink，
+        // 理论不可达——穷尽匹配兜底按内部错误处理
+        Ok(Ok(AggregateOutcome::SseSent)) => openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "unexpected SseSent from Json sink",
+        ),
+        Err(e) => openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            &format!("task join error: {}", e),
+        ),
+    }
+}
+
+/// 聚合内核出口（issue #213 S3）：wb_aggregate_chat 闭包主体参数化抽出——
+/// 单一内核两出口（AggregateSink::Json = 现状聚合行为；AggregateSink::Sse =
+/// 伪流式 S5 使用），杜绝复制漂移。Json 出口行为必须与抽出前逐字节一致。
+pub(crate) enum AggregateSink {
+    /// 现状聚合：成功 completion 由薄壳按 proto 投影 JSON 响应
+    Json,
+    /// 伪流式（S5）：成功 completion 就地合成 SSE 帧序列下发
+    Sse {
+        tx: SseTx,
+        proto: Protocol,
+        chat_id: String,
+    },
+}
+
+/// 聚合内核成功出口产物（issue #213 S3）：
+/// - Completion：聚合 completion（Json sink；薄壳按 proto 投影，行为与抽出前一致）
+/// - SseSent：SSE 帧已合成下发完毕（Sse sink；薄壳无需再构造响应体）
+pub(crate) enum AggregateOutcome {
+    Completion(Value),
+    SseSent,
+}
+
+/// wb 聚合内核（issue #213 S3 抽取，源 main 6f8a8cb）：wb_aggregate_chat 与
+/// 伪流式 wb_pseudo_stream 共用执行管线（粘性/冷却/换号重试/记账全在内核内），
+/// 返回 `Ok(AggregateOutcome::Completion)` / `Err(错误串)`；JSON/SSE 两种 sink
+/// 形态由 sink 参数分流（wb_aggregate_chat 出 JSON Response、wb_pseudo_stream
+/// 出 SSE 帧序列）。执行含分级重试退避，调用方必须置于 spawn_blocking（勿在
+/// async 上下文直接调用）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wb_aggregate_core(
+    state: Arc<ApiSharedState>,
+    buddy_ai: bool,
+    body_vec: Vec<u8>,
+    model: String,
+    stream: bool,
+    start_ts: Instant,
+    key_id: String,
+    guard: InflightGuard,
+    encoded: std::collections::HashSet<String>,
+    fallback: Vec<super::dispatch::PoolCandidate>,
+    sink: AggregateSink,
+) -> Result<AggregateOutcome, String> {
+    // inflight guard 随后台任务存续至聚合完成（§4.5）；F-77 取号后绑定账号级计数
+    let mut guard = guard;
+    // wb 族池视图（§3.2）：Buddy（CN）/ BuddyAI（Intl）共用执行内核；
+    // 影子化后家族字段（route_pool/route_sticky/记账桶/池标签）按视图分流，
+    // 共享字段（data_dir/logger/wb_sanitize）经 Deref 零改动
+    let state = WbView::new(state, buddy_ai);
+    // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
+    let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
+    // issue #138 P0：peek DOM 用完即弃（同流式路径口径）
+    let (sticky_key, effort_hint) = {
+        let peek: Value = serde_json::from_slice(&body_vec).unwrap_or(json!({}));
+        // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
+        log_longctx_hint(&state, &peek, &model);
+        (
+            SessionKey::from_body(&peek),
+            peek.get("reasoning_effort").and_then(|v| v.as_str()).map(str::to_string),
+        )
+    };
+    let templates = load_templates(&state);
+    // 工具名别名表（issue #150 接线）：WB 族池（Buddy CN / BuddyAI Intl）共用；
+    // 与 wb_stream_chat 同口径（详见该入口注记）
+    let tool_alias_rules = load_tool_alias_rules(&state);
+    // 本次请求命中流水游标（issue #195 方案 B5，口径同流式路径）
+    let hit_cursor = wb_payload::template_hits_mark();
+    let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
+
+    // F-35 子 Key 约束（与非流式同款；issue #30 混合白名单按前缀作用域分池）
+    let (allowed_set, dedicated) = super::api_keys::constraints_for(&state.data_dir, &key_id)
+        .and_then(|k| k.pool_constraints(state.pool_label()))
+        .map_or((None, None), |c| (c.allowed, c.dedicated));
+
+    let sticky0: Option<(String, String)> = state
+        .sticky_resolve(&sticky_key, now_ts())
+        .and_then(|b| {
+            if allowed_set.as_ref().map_or(false, |a| !a.contains(&b.uid)) {
+                return None;
+            }
+            // issue #206：粘性账号对模型冷却中 → 放弃绑定（冷却让位语义），
+            // 防聚合/伪流式固定打冷却中的账号（口径同 run_wb_stream sticky0）
+            if account_model_cooling_remaining(&state, &b.uid, &model).is_some() {
+                return None;
+            }
+            state
+                .route_pool()
+                .pick_by_uid(&b.uid, false)
+                .map(|_| (b.uid, b.conv_id))
+        });
+    let sticky_uid: Option<String> = sticky0.as_ref().map(|(u, _)| u.clone());
+    let sticky_conv: String = sticky0
+        .as_ref()
+        .map(|(_, c)| c.clone())
+        .unwrap_or_default();
+    let mut first_pick: Option<PickedAccount> = sticky0
+        .as_ref()
+        .and_then(|(u, _)| {
+            state
+                .route_pool()
+                .pick_sticky_yield(u, allowed_set.as_ref(), false)
+                .map(|(p, ev)| {
+                    if let Some(ev) = ev {
+                        state.logger.log_sched_event(&ev);
+                    }
+                    p
+                })
+        })
+        .or_else(|| {
+            // issue #206：专一绑定同样按账号×模型冷却过滤（冷却中视为不可用，
+            // 交由常规调度让位给其他账号；口径同 run_wb_stream 专一分支）
+            let uid = dedicated.as_deref()?;
+            if account_model_cooling_remaining(&state, uid, &model).is_some() {
+                return None;
+            }
+            state.route_pool().pick_by_uid(uid, false)
+        });
+
+    let mut tried: HashSet<String> = HashSet::new();
+    let mut refreshed: HashSet<String> = HashSet::new();
+    // issue #213 阶段2 审查修复：预算累计计数器（口径同 run_wb_stream 流式
+    // 路径声明处注释——重开轮换清空 tried 后 tried.len() 会归零，必须用
+    // 跨轮累计值判预算，否则 cut/空完成不冷却场景下无限轮换）
+    let mut budget_used: u32 = 0;
+    let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
+    // PR #162：传输掐断计数（聚合侧对齐流式路径）
+    let mut cut_hits: usize = 0;
+    let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
+    let mut last_residual_note: Option<String> = None; // 残指纹自检按请求去重（issue #122 C3）
+    // issue #195：11128 激进升级按请求一次（口径同流式路径——wb_sanitize
+    // 默认开时旧守卫 `!sanitize` 恒假，首轮 11128 直接 Fatal）
+    let mut aggressive_tried = false;
+
+    loop {
+        // 客户端断连检测（审查修复：对齐 run_wb_stream loop 顶部口径）——
+        // 仅 Sse sink（伪流式）持有客户端通道；断连即终止轮换，不再烧账号
+        //（RetrySame 退避最长 60s×N，此前需烧完当前轮换才终止）
+        if let AggregateSink::Sse { tx, .. } = &sink {
+            if tx.is_closed() {
+                state.record_usage_bucket(state.usage_bucket(), &model, "none", &key_id, false, stream, start_ts.elapsed().as_millis() as u64, 0, 0);
+                return Ok(AggregateOutcome::SseSent);
+            }
+        }
+        let picked = match first_pick.take() {
+            Some(p) => p,
+            None => match state.route_pool().pick_excluding_constrained_ev_matching(
+                &tried,
+                allowed_set.as_ref(),
+                dedicated.as_deref(),
+                false,
+                // issue #206：账号×模型冷却过滤——SoftRate 429 对某账号某模型
+                // 冷却后，该账号在其他模型仍可用
+                &|uid| account_model_cooling_remaining(&state, uid, &model).is_none(),
+            ) {
+                Some((p, ev)) => {
+                    if let Some(ev) = ev {
+                        state.logger.log_sched_event(&ev);
+                    }
+                    p
+                }
+                None => {
+                    // issue #213 阶段2：预算重开轮换（口径同 run_wb_stream 流式
+                    // 路径——聚合/伪流式两出口共用本内核）
+                    let budget = state.retry_budget(state.buddy_ai);
+                    let rounds = budget_used;
+                    if let Some(new_tried) = budget_retry_round(&state, &tried, &model, rounds, budget) {
+                        let round = rounds / state.route_pool().count().max(1) as u32;
+                        let delay = budget_backoff_ms(round.max(1));
+                        state.logger.log_sched_event(&format!(
+                            "retry budget 重开轮换 round={}/budget={} 退避 {}ms pool={}",
+                            round.max(1),
+                            budget,
+                            delay,
+                            state.pool_label(),
+                        ));
+                        std::thread::sleep(std::time::Duration::from_millis(delay));
+                        // 断连检查（对齐 §4.5 聚合检查点口径）：退避后客户端离开即终止
+                        if let AggregateSink::Sse { tx, .. } = &sink {
+                            if tx.is_closed() {
+                                state.record_usage_bucket(state.usage_bucket(), &model, "none", &key_id, false, stream, start_ts.elapsed().as_millis() as u64, 0, 0);
+                                return Ok(AggregateOutcome::SseSent);
+                            }
+                        }
+                        tried = new_tried;
+                        continue;
+                    }
+                    // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
+                    let (healthy_total, _) = state.route_pool().selectable_stats_in(None, false);
+                    let (hard_credit_cnt, _) = state.route_pool().hard_credit_stats();
+                    let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message_with_transport_cut(
+                        state.pool_label(),
+                        empty_hits,
+                        tried.len(),
+                        healthy_total,
+                        hard_credit_cnt,
+                        cut_hits,
+                    );
+                    // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导才标记
+                    super::wb_payload::mark_channel_fp_block(
+                        state.pool_label(),
+                        exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK",
+                    );
+                    // issue #99 ①：影子风控收尾落原始指纹样本（非流式路径无
+                    // 收尾 [DEBUG] 行，就地补齐；样本 = 清洗前原始请求体）
+                    if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
+                        state.logger.log_debug_line(format!(
+                            "[DEBUG] {exhaust_tag} tried={} empty_hits={} cut_hits={} pool={} 指纹样本: {}",
+                            tried.len(),
+                            empty_hits,
+                            cut_hits,
+                            state.pool_label(),
+                            wb_payload::fingerprint_sample(&body_vec),
+                        ));
+                    }
+                    // issue #213 S5：Sse 出口跨池兜底移交（对齐 run_wb_stream 耗尽
+                    // 收尾既有范式）——移交成功由接收池落终态用量，本池不补 "none"
+                    // 行（防双记账）；移交失败/无 fallback → 本池落 "none" 行 +
+                    // 按 proto 发错误帧收尾（客户端仍持开流）
+                    if let AggregateSink::Sse { tx, proto, chat_id } = sink {
+                        if !fallback.is_empty() && !tx.is_closed() {
+                            if super::cross_pool::continue_stream_on_next_pool(
+                                &state.state, state.pool_label(), &fallback, &body_vec, proto,
+                                &key_id, &chat_id, &tx, guard, &encoded, start_ts,
+                            ) {
+                                return Ok(AggregateOutcome::SseSent);
+                            }
+                        }
+                        state.record_usage_bucket(state.usage_bucket(), &model, "none", &key_id, false, stream,
+                            start_ts.elapsed().as_millis() as u64, 0, 0);
+                        send_pseudo_exhaust_frame(&tx, proto, &model, &exhaust_msg);
+                        return Ok(AggregateOutcome::SseSent);
+                    }
+                    state.record_usage_bucket(state.usage_bucket(), &model, "none", &key_id, false, stream,
+                        start_ts.elapsed().as_millis() as u64, 0, 0);
+                    return Err(exhaust_msg);
+                }
+            },
+        };
+        tried.insert(picked.uid.clone());
+        budget_used += 1; // 预算累计计数（重开轮换不清零，见声明处注释）
+        // F-77 账号级在途计数：取号即绑定。
+        // 审查 P1-4 TOCTOU 收紧：普通候选 CAS 复核「在途 < 并发上限」，已满则
+        // 不发起请求换下一候选（不计错误不冷却）；over_limit 候选（专一/粘性
+        // 锁定、busy_fallback 降级）保留原无条件绑定语义。
+        // active_uid 仅在绑定成功后更新（CAS 拒绝的候选不得污染「当前账号」展示）
+        let bound = if picked.over_limit {
+            guard = guard.bind_account(state.route_pool().inflight_handle(&picked.uid));
+            true
+        } else {
+            guard.bind_account_cas(
+                state.route_pool().inflight_handle(&picked.uid),
+                state.route_pool().concurrency_limit(),
+            )
+        };
+        if !bound {
+            continue;
+        }
+        *safe_lock(&state.active_uid) = Some(picked.uid.clone());
+
+        let is_sticky_hit =
+            sticky_uid.as_deref() == Some(picked.uid.as_str()) && !sticky_conv.is_empty();
+        let conv_id = if is_sticky_hit {
+            sticky_conv.clone()
+        } else {
+            gen_conv_id()
+        };
+
+        let catalog = super::wb_catalog::load(&state.data_dir);
+        let effort = super::wb_catalog::find(&catalog, &model)
+            .and_then(|m| m.resolve_effort(effort_hint.as_deref()));
+        // 多候选改写种子 + 激进清洗开关（issue #122 方案 C1/C2，同流式路径口径：
+        // 种子随换号轮换递增，空完成后/池级拦截 TTL 内/本请求已 11128 升级
+        //（aggressive_tried，issue #195——换号保持激进，防指纹回归）追加激进规则）
+        let seed = wb_payload::variant_seed(&conv_id, tried.len() as u64);
+        let mut converted = wb_payload::prepare_wb_chat_body(
+            &body_vec, &model, &picked.uid, &conv_id, effort.as_deref(), sanitize, &templates,
+            seed, empty_hits > 0 || aggressive_tried || wb_payload::fp_block_recent(state.pool_label()),
+        );
+        // 工具别名正向改写（issue #150）：受 sanitize 门控，与 Trae/Qoder 池同口径；
+        // 逆映射随本轮账号产物，成功分支经 Ok((r, tool_alias)) 带出供响应侧回改
+        let mut tool_alias: Option<std::collections::HashMap<String, String>> = None;
+        if sanitize {
+            tool_alias =
+                wb_payload::apply_tool_alias_forward(&mut converted, &tool_alias_rules);
+        }
+        // 残指纹自检（issue #122 方案 C3，同流式路径口径：按请求去重）
+        if sanitize {
+            if let Some(note) =
+                wb_payload::residual_fingerprint_note_rules_bytes(&converted, &tool_alias_rules)
+            {
+                if last_residual_note.as_deref() != Some(note.as_str()) {
+                    last_residual_note = Some(note.clone());
+                    state.logger.log_debug_line(format!(
+                        "[DEBUG] 残指纹自检命中: {note} pool={} uid={}",
+                        state.pool_label(),
+                        picked.uid
+                    ));
+                }
+            }
+        }
+        let mut creds = WbCreds {
+            id: picked.uid.clone(),
+            uid: picked.uid.clone(),
+            name: String::new(),
+            token: picked.jwt.clone(),
+            domain: picked.domain.clone(),
+            enterprise_id: picked.enterprise_id.clone(),
+            global_region: picked.global_region,
+        };
+
+        let mut same_attempt: u32 = 0;
+        loop {
+            let ttfb_start = Instant::now();
+            match wb_upstream::make_wb_request(&creds, &conv_id, &converted) {
+                Ok(reader) => {
+                    // 首字超时：非流式聚合同样适用（上游只回 SSE）；
+                    // F-76③ 慢请求竞速对冲（对冲关闭时与纯首字超时语义一致）
+                    let mut win = match race_first_byte(
+                        &state,
+                        &picked.uid,
+                        &conv_id,
+                        &model,
+                        &converted,
+                        reader,
+                        &tried,
+                        allowed_set.as_ref(),
+                        dedicated.as_deref(),
+                    ) {
+                        Ok(w) => w,
+                        Err(()) => {
+                            note_wb_error(&state, &picked.uid, &model, ErrKind::Server, None, None);
+                            break;
+                        }
+                    };
+                    let ttfb_ms = ttfb_start.elapsed().as_millis() as u64;
+                    guard = settle_hedge(&state, &mut win, guard, &picked.uid);
+                    let win_uid = win.uid.as_str();
+                    let (resp, error_info) =
+                        wb_sse::aggregate(win.lines, &format!("chatcmpl-{}", now_ts()), tool_alias.as_ref());
+                    // P2-2：读错误槽合并——掐断时丢弃部分响应（非流式不得把
+                    // 截断数据当成功交付，可能含残缺 tool_calls JSON），按流内
+                    // 错误换号重试
+                    let (resp, error_info) =
+                        aggregate_with_transport_cut(resp, error_info, &win.read_slot);
+                    let duration_ms = start_ts.elapsed().as_millis() as u64;
+                    match (resp, error_info) {
+                        (Some(mut r), None) => {
+                            if super::aggregated_response_is_empty(&r) {
+                                // 空完成（影子风控/上游异常，issue #57）：换号重试，
+                                // 口径同下方「empty response」（Server 级短冷却）
+                                empty_hits += 1;
+                                note_wb_error(&state, win_uid, &model, ErrKind::Server, None, None);
+                                // 每请求终态单行（审查问题6）：换号是中间态不落账
+                                // （终局由后续成功行/耗尽 none 行统一落）
+                                state.logger.log_request_ttfb(
+                                    state.pool_label(), "POST", "/v2/chat/completions", &model, stream, 502, win_uid,
+                                    duration_ms, Some(ttfb_ms), &key_name,
+                                    &state.route_pool().name_of(win_uid), Some(&format!("空完成 → 换号重试{}", wb_payload::template_hit_note())),
+                                );
+                                break;
+                            }
+                            r["model"] = json!(model);
+                            // 宽口径提取（别名 + 字符串数字形态，审查 P2）
+                            let (pt, ct) = r.get("usage").map(u64_pair).unwrap_or((0, 0));
+                            // M4 审查修复：缓存读 tokens 旁路入账（未下发得 0 不入账）
+                            state.record_usage_cached(
+                                state.usage_bucket(),
+                                r.get("usage").map(cached_tokens_of).unwrap_or(0),
+                            );
+                            // F-76① TTFT 入账
+                            state.record_usage_bucket_ttfb(state.usage_bucket(), &model, win_uid, &key_id, true, stream, duration_ms, pt, ct, Some(ttfb_ms));
+                            state.route_pool().note_success(win_uid);
+                            clear_model_failure(&state, &model);
+                            // issue #206：成功请求解除该账号×该模型的冷却对
+                            clear_account_model_cooldown(&state, win_uid, &model);
+                            state.sticky_bind(&sticky_key, win_uid, &conv_id, now_ts());
+                            state.route_sticky().save(&state.data_dir);
+                            state.logger.log_request_ttfb(
+                                state.pool_label(), "POST", "/v2/chat/completions", &model, stream, 200, win_uid,
+                                duration_ms, Some(ttfb_ms), &key_name,
+                                &state.route_pool().name_of(win_uid), None,
+                            );
+                            // 成功出口（S3）：Json sink 原样带出 completion（薄壳投影，
+                            // tool_alias 与原路径一致在此丢弃——流式收集阶段已回改原名，
+                            // 此处再回改会二次改名损坏工具名）；Sse sink 就地合成下发
+                            return match sink {
+                                AggregateSink::Json => Ok(AggregateOutcome::Completion(r)),
+                                AggregateSink::Sse { tx, proto, chat_id } => {
+                                    synthesize_sse(&tx, proto, &r, &chat_id, &model, &encoded);
+                                    Ok(AggregateOutcome::SseSent)
+                                }
+                            };
+                        }
+                        (None, Some((code, msg))) => {
+                            // P2-2：传输层掐断（账号无关传输故障）——不冷却、不解绑
+                            // 粘性、不计空完成指纹，换号重试
+                            if super::is_transport_cut(code, &msg) {
+                                state.logger.log_request_ttfb(
+                                    state.pool_label(), "POST", "/v2/chat/completions", &model, stream, 200, win_uid,
+                                    duration_ms, Some(ttfb_ms), &key_name,
+                                    &state.route_pool().name_of(win_uid), Some(&msg),
+                                );
+                                // PR #162：cut_hits 计入轮换耗尽归因（与流式路径同口径）
+                                cut_hits += 1;
+                                break;
+                            }
+                            // 11128 流内形态（issue #123）：口径同下方 Err 分支——
+                            // 未清洗 → 强制清洗同号重试一次；已清洗仍命中 →
+                            // 落指纹样本后换号（不冷却：指纹拦截与账号无关）
+                            if code == 11128 || super::retry::is_illegal_channel_error(&msg) {
+                                // issue #195：升级守卫改为按请求一次性旗标（口径同流式路径）
+                                if !aggressive_tried {
+                                    aggressive_tried = true;
+                                    sanitize = true;
+                                    state.logger.log_sched_event(&format!(
+                                        "11128 强制清洗重试（流内）{}", wb_payload::template_hit_note()
+                                    ));
+                                    converted = wb_payload::prepare_wb_chat_body(
+                                        &body_vec, &model, &picked.uid, &conv_id, effort.as_deref(),
+                                        true, &templates, seed, true,
+                                    );
+                                    // 重建后须重做工具别名（issue #150）：与流式形态同口径
+                                    tool_alias = wb_payload::apply_tool_alias_forward(
+                                        &mut converted, &tool_alias_rules,
+                                    );
+                                    std::thread::sleep(std::time::Duration::from_millis(200));
+                                    continue; // 内层 loop：同号重试
+                                }
+                                // Fatal 终局：样本按请求最多落一次（落完即
+                                // return，无需按请求去重）
+                                let sample = wb_payload::fingerprint_sample(&body_vec);
+                                // 归因探针须用胜者凭证：对冲胜出时 win_uid 可能 ≠
+                                // picked.uid，而 creds 是按 picked 构造的——用 picked
+                                // 凭证探针会把账号/池标记归因到未参与本次失败请求的
+                                // 账号（审查修复）。胜者 ≠ picked 时放弃探针（宁缺勿错）
+                                let probe: Option<(&WbCreds, &str)> = if win_uid == picked.uid {
+                                    Some((&creds, &model))
+                                } else {
+                                    None
+                                };
+                                log_and_record_11128(
+                                    &state, &sample, &converted, &tool_alias_rules, hit_cursor,
+                                    probe,
+                                );
+                                state.logger.log_sched_event(
+                                    "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
+                                );
+                                // 已清洗仍命中：指纹拦截与账号无关，换号必再命中
+                                //（issue #57 口径）——Fatal 终局，外层透传 400
+                                let fatal_msg = format!("upstream 400 error: 11128 {}", msg);
+                                // 记账（审查修复）：归因统一 win_uid（对冲胜者可能
+                                // 与 picked 不一致，与上方日志及流式 Fatal 口径一致）
+                                state.record_usage_bucket(state.usage_bucket(), &model, win_uid, &key_id, false, stream, duration_ms, 0, 0);
+                                state.logger.log_request_ttfb(
+                                    state.pool_label(), "POST", "/v2/chat/completions", &model, stream, 400, win_uid,
+                                    duration_ms, Some(ttfb_ms), &key_name,
+                                    &state.route_pool().name_of(win_uid), Some(&fatal_msg),
+                                );
+                                // Sse sink Fatal 收尾（伪流式静默断流修复）：HTTP 200
+                                // 已发出无法改状态码，内核内按 proto 发错误帧后再透传
+                                // Err——否则客户端只收到 keep-alive 后连接静默关闭
+                                //（Json sink 由 wb_aggregate_chat 外层映射 HTTP 错误，跳过）
+                                if let AggregateSink::Sse { tx, proto, .. } = &sink {
+                                    send_pseudo_exhaust_frame(tx, *proto, &model, &fatal_msg);
+                                }
+                                return Err(fatal_msg);
+                            }
+                            let kind = classify_wb_error(code, &msg);
+                            if kind != ErrKind::None {
+                                // issue #206：SoftRate 记账号×模型冷却对
+                                //（不钉账号级 until），其余维持既有分账（口径同流式路径）
+                                note_wb_error(&state, win_uid, &model, kind, Some(&msg), None);
+                            }
+                            *safe_lock(&state.last_error) =
+                                Some(format!("wb uid={} code={} msg={}", win_uid, code, msg));
+                            // 每请求终态单行（审查问题6）：换号是中间态不落账
+                            // （终局由后续成功行/耗尽 none 行统一落）
+                            state.logger.log_request_ttfb(
+                                state.pool_label(), "POST", "/v2/chat/completions", &model, stream, 200, win_uid,
+                                duration_ms, Some(ttfb_ms), &key_name,
+                                &state.route_pool().name_of(win_uid), Some(&msg),
+                            );
+                            // 流内错误且未产出内容 → 换号重试
+                            break;
+                        }
+                        _ => {
+                            note_wb_error(&state, win_uid, &model, ErrKind::Server, None, None);
+                            // 每请求终态单行（审查问题6）：换号是中间态不落账
+                            state.logger.log_request_ttfb(
+                                state.pool_label(), "POST", "/v2/chat/completions", &model, stream, 502, win_uid,
+                                duration_ms, Some(ttfb_ms), &key_name,
+                                &state.route_pool().name_of(win_uid), Some("empty response"),
+                            );
+                            break;
+                        }
+                    }
+                }
+                Err((status, resp_body, retry_after)) => {
+                    // 11128 渠道风控（issue #57）：清洗未启用时强制清洗后同号重试一次
+                    if status == 400 && super::retry::is_illegal_channel_error(&resp_body) {
+                        // issue #195：升级守卫改为按请求一次性旗标（口径同流式路径）
+                        if !aggressive_tried {
+                            aggressive_tried = true;
+                            sanitize = true;
+                            state.logger.log_sched_event(&format!(
+                                "11128 强制清洗重试{}", wb_payload::template_hit_note()
+                            ));
+                            // aggressive=true（issue #122 缺口3，同流式路径口径）
+                            converted = wb_payload::prepare_wb_chat_body(
+                                &body_vec, &model, &picked.uid, &conv_id, effort.as_deref(), true, &templates,
+                                seed, true,
+                            );
+                            // 重建后须重做工具别名（issue #150，合并审查补漏）：
+                            // 内层 loop 重发 converted 不会再走顶部 prepare 段，
+                            // 强制清洗重试若不带别名，11128 仍以原名工具集发出
+                            tool_alias = wb_payload::apply_tool_alias_forward(
+                                &mut converted, &tool_alias_rules,
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                            continue;
+                        }
+                        // 清洗已启用仍命中（issue #99 诊断闭环）：落原始指纹样本
+                        // + 按请求去重（换号轮换重复命中样本恒定）；Fatal 透传前
+                        // 附排查指引（仅日志，客户端响应体不变）
+                        let sample = wb_payload::fingerprint_sample(&body_vec);
+                        if last_11128_sample.as_deref() != Some(sample.as_str()) {
+                            last_11128_sample = Some(sample.clone());
+                            log_and_record_11128(
+                                &state, &sample, &converted, &tool_alias_rules, hit_cursor,
+                                Some((&creds, &model)),
+                            );
+                            state.logger.log_sched_event(
+                                "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
+                            );
+                        }
+                    }
+                    match retry_plan(status, &resp_body, same_attempt, retry_after) {
+                        RetryAction::RetrySame { delay_ms } => {
+                            same_attempt += 1;
+                            std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(60_000)));
+                            // 断连检查（2026-11-21 审查修复，对齐流式路径同位置与上方
+                            // budget 退避检查点）：退避期间客户端离开则终止，不再打满
+                            // 三次退避+请求
+                            if let AggregateSink::Sse { tx, .. } = &sink {
+                                if tx.is_closed() {
+                                    state.record_usage_bucket(state.usage_bucket(), &model, "none", &key_id, false, stream, start_ts.elapsed().as_millis() as u64, 0, 0);
+                                    return Ok(AggregateOutcome::SseSent);
+                                }
+                            }
+                            continue;
+                        }
+                        RetryAction::SwitchKey => {
+                            if status == 401 && !refreshed.contains(&picked.uid) {
+                                refreshed.insert(picked.uid.clone());
+                                match wb_upstream::refresh_access_token_for(&state.data_dir, &picked.uid, Some(&creds.token), state.buddy_ai) {
+                                    Ok(new_token) => {
+                                        state.route_pool().update_jwt(&picked.uid, &new_token);
+                                        creds.token = new_token;
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        *safe_lock(&state.last_error) =
+                                            Some(format!("wb refresh uid={} err={}", picked.uid, e));
+                                        // 他方进程刷新中：本轮换号且不走 note_error（防瞬时
+                                        // 忙态误置 disabled），对方刷新结果由下轮请求复用
+                                        if e == wb_upstream::ERR_PEER_REFRESHING {
+                                            break;
+                                        }
+                                        // 审查修复（第五轮）：传输层瞬时失败同上分流——
+                                        // 「刷新请求失败:」前缀为网络/响应异常，换号不 classify
+                                        if e.starts_with("刷新请求失败") {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            let kind = classify_wb_http_error(status, &resp_body);
+                            if kind != ErrKind::None {
+                                // issue #159：kind=None（4001 模型配置不匹配）不冷却，对齐流内路径；
+                                // issue #206：SoftRate 记账号×模型冷却对（不钉账号级 until）；
+                                // 其余类别维持既有账号级/模型级分账（口径同流式路径）
+                                let upstream = upstream_msg(&resp_body);
+                                note_wb_error(&state, &picked.uid, &model, kind,
+                                    upstream.as_deref(), retry_after);
+                            }
+                            *safe_lock(&state.last_error) =
+                                Some(format!("wb uid={} status={}", picked.uid, status));
+                            // 每请求终态单行（审查问题6）：SwitchKey → 换号是中间态，
+                            // 不落账（对齐流式路径），由终局分支统一落行
+                            state.logger.log_request(
+                                state.pool_label(), "POST", "/v2/chat/completions", &model, stream, status, &picked.uid,
+                                start_ts.elapsed().as_millis() as u64,
+                                &key_name, &state.route_pool().name_of(&picked.uid),
+                                Some(&format!("upstream status={}", status)),
+                            );
+                            break;
+                        }
+                        RetryAction::Fatal => {
+                            // 终态记账对齐 SwitchKey 分支（审查 F3）：Fatal 是请求
+                            // 终局，此前仅 log_request 导致用量统计页缺口
+                            state.record_usage_bucket(state.usage_bucket(), &model, &picked.uid, &key_id, false, stream,
+                                start_ts.elapsed().as_millis() as u64, 0, 0);
+                            state.logger.log_request(
+                                state.pool_label(), "POST", "/v2/chat/completions", &model, stream, status, &picked.uid,
+                                start_ts.elapsed().as_millis() as u64,
+                                &key_name, &state.route_pool().name_of(&picked.uid),
+                                Some(&safe_slice(&resp_body, 300)),
+                            );
+                            let fatal_msg = format!(
+                                "upstream {} error: {}",
+                                status,
+                                safe_slice(&resp_body, 300)
+                            );
+                            // Sse sink Fatal 收尾（伪流式静默断流修复，口径同 11128
+                            // Fatal 分支）：发 proto 错误帧防客户端静默断流
+                            if let AggregateSink::Sse { tx, proto, .. } = &sink {
+                                send_pseudo_exhaust_frame(tx, *proto, &model, &fatal_msg);
+                            }
+                            return Err(fatal_msg);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+// ==================== T5.5/F-64 网关工具代执行编排 ====================
+
+/// Responses 工具代执行主流程（仅 /v1/responses 且声明 web_search 类工具时进入）：
+/// 上游请求内部固定非流式（stream:false）→ 聚合 → 提取代执行工具调用 → 本地执行
+/// → 结果回喂 → 循环直至最终回复（上限 MAX_ROUNDS 防积分失控）。
+///
+/// 输出投影：
+/// - 历史代执行搜索轮 → 原生 `web_search_call` 输出项（置于 message 之前）；
+/// - 最终回复 → 既有 completion_to_responses 投影；
+/// - 客户端 stream=true 时按 Responses SSE 事件序列（created → items → completed）
+///   由聚合结果合成下发；stream=false 直接返回 JSON。
+///
+/// 简化说明：本路径不复用粘性绑定（多轮工具回喂非单轮会话语义），账号选取与
+/// Key 约束/分级重试与非流式管线同一套规则。
+pub async fn wb_tool_exec_chat(
+    state: Arc<ApiSharedState>,
+    buddy_ai: bool,
+    mut chat_body: Value,
+    model: String,
+    stream: bool,
+    start_ts: Instant,
+    key_id: String,
+    guard: InflightGuard,
+    encoded: std::collections::HashSet<String>,
+) -> Response {
+    let model_inner = model.clone();
+    // P2 修复：工具代执行多轮上游请求 + 重试退避（最长 60s×N），长阻塞占主池
+    // 会饿死鉴权等短任务，与非流式聚合一并迁入 stream_runtime 专用阻塞池
+    let result = super::stream_runtime().spawn_blocking(move || {
+        // inflight guard 随后台任务存续至编排完成（§4.5）；F-77 取号后绑定账号级计数
+        let mut guard = guard;
+        let model = model_inner;
+        // wb 族池视图（§3.2）：影子化分流（同 wb_aggregate_chat 注释）
+        let state = WbView::new(state, buddy_ai);
+        // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
+        let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
+        let templates = load_templates(&state);
+        // 工具名别名表（issue #150 接线）：WB 族池（Buddy CN / BuddyAI Intl）共用；
+        // 与 wb_stream_chat 同口径（详见该入口注记）
+        let tool_alias_rules = load_tool_alias_rules(&state);
+        // 本次请求命中流水游标（issue #195 方案 B5，口径同流式路径）
+        let hit_cursor = wb_payload::template_hits_mark();
+        let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
+        // P1-6 劫持防护：false = 客户端已声明同名 function 工具，未注入代理工具，
+        // 全程跳过代执行（客户端工具调用照常透传，由客户端自行执行）
+        let proxy_exec = super::wb_toolexec::inject_proxy_tools(&mut chat_body);
+        // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
+        log_longctx_hint(&state, &chat_body, &model);
+
+        // F-35 子 Key 约束（与非流式同款；issue #30 混合白名单按前缀作用域分池）
+        let (allowed_set, dedicated) = super::api_keys::constraints_for(&state.data_dir, &key_id)
+            .and_then(|k| k.pool_constraints(state.pool_label()))
+            .map_or((None, None), |c| (c.allowed, c.dedicated));
+
+        let catalog = super::wb_catalog::load(&state.data_dir);
+        let effort = super::wb_catalog::find(&catalog, &model)
+            .and_then(|m| m.resolve_effort(chat_body.get("reasoning_effort").and_then(|v| v.as_str())));
+
+        let mut tried: HashSet<String> = HashSet::new();
+        let mut refreshed: HashSet<String> = HashSet::new();
+        let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
+        // 11128 强制清洗升级（issue #122 缺口3）：toolexec 无独立重建调用点，
+        // 11128 分支置位后由 round 回退重跑 prepare 时生效
+        let mut force_aggressive = false;
+        let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
+        let mut last_residual_note: Option<String> = None; // 残指纹自检按请求去重（issue #122 C3）
+        let mut records: Vec<super::wb_toolexec::SearchRecord> = Vec::new();
+        let mut final_completion: Option<Value> = None;
+        let mut success_uid: Option<String> = None; // 审查修复：保留真实账号归因
+        let mut last_err: Option<String> = None;
+        // F-76① TTFT：各轮首字耗时（最终轮即最终回复的首字延迟）
+        let mut last_ttfb_ms: Option<u64> = None;
+        // 请求级 usage 累加（跨账号跨轮次，含失败账号与中间轮的真实消耗）——
+        // 失败终局记账带上（审查 P1：原硬编码 0,0 把已消耗的 tokens 全部丢弃）；
+        // 成功终局仍以 completion 写回值为准（只含最终成功账号，维持不变）
+        let mut req_acc_usage = (0u64, 0u64);
+        let resp_id = format!("resp_{}", now_ts());
+
+        'accounts: loop {
+            let picked = match state.route_pool().pick_excluding_constrained_ev_matching(
+                &tried,
+                allowed_set.as_ref(),
+                dedicated.as_deref(),
+                false,
+                // issue #206：账号×模型冷却过滤（对齐流式路径）
+                &|uid| account_model_cooling_remaining(&state, uid, &model).is_none(),
+            ) {
+                Some((p, ev)) => {
+                    if let Some(ev) = ev {
+                        state.logger.log_sched_event(&ev);
+                    }
+                    p
+                }
+                None => break,
+            };
+            tried.insert(picked.uid.clone());
+            let conv_id = gen_conv_id();
+            // F-77 账号级在途计数：取号即绑定。
+            // 审查 P1-4 TOCTOU 收紧：普通候选 CAS 复核「在途 < 并发上限」，已满则
+            // 不发起请求换下一候选（不计错误不冷却）；over_limit 候选（专一锁定）
+            // 保留原无条件绑定语义。
+            // active_uid 仅在绑定成功后更新（CAS 拒绝的候选不得污染「当前账号」展示）
+            let bound = if picked.over_limit {
+                guard = guard.bind_account(state.route_pool().inflight_handle(&picked.uid));
+                true
+            } else {
+                guard.bind_account_cas(
+                    state.route_pool().inflight_handle(&picked.uid),
+                    state.route_pool().concurrency_limit(),
+                )
+            };
+            if !bound {
+                continue;
+            }
+            *safe_lock(&state.active_uid) = Some(picked.uid.clone());
+            let mut creds = WbCreds {
+                id: picked.uid.clone(),
+                uid: picked.uid.clone(),
+                name: String::new(),
+                token: picked.jwt.clone(),
+                domain: picked.domain.clone(),
+                enterprise_id: picked.enterprise_id.clone(),
+                global_region: picked.global_region,
+            };
+            let mut same_attempt: u32 = 0;
+
+            // 工具代执行轮次循环（每轮 = 一次上游请求）
+            let mut round: usize = 0;
+            // 各轮上游 usage 累加（含最终轮），成功时写回最终 completion——
+            // 多轮回喂的真实消耗 = 各轮之和，只记最终轮会少计中间轮
+            let mut acc_usage = (0u64, 0u64);
+            let mut acc_cached = 0u64;
+            let mut acc_cache_write = 0u64;
+            let outcome = loop {
+                if round >= super::wb_toolexec::MAX_ROUNDS {
+                    break Err(format!(
+                        "工具代执行轮数已达上限（{} 轮），上游仍未产出最终回复；已执行 {} 次搜索/读取",
+                        super::wb_toolexec::MAX_ROUNDS,
+                        records.len()
+                    ));
+                }
+                round += 1;
+
+                let body_bytes = serde_json::to_vec(&chat_body).unwrap_or_default();
+                // 多候选改写种子（issue #122 方案 C1）：conv_id 绑定账号、round 随
+                // 工具执行轮次递增；空完成后/池级拦截 TTL 内/11128 强制清洗
+                // （issue #122 缺口3）追加激进清洗（issue #122 方案 C2）
+                let mut converted = wb_payload::prepare_wb_chat_body(
+                    &body_bytes, &model, &picked.uid, &conv_id, effort.as_deref(), sanitize, &templates,
+                    wb_payload::variant_seed(&conv_id, round as u64),
+                    empty_hits > 0 || force_aggressive || wb_payload::fp_block_recent(state.pool_label()),
+                );
+                // 工具别名正向改写（issue #150）：受 sanitize 门控，与 Trae/Qoder 池同口径；
+                // 每轮重建后都重做（continue 回顶部即重新走本段，逆映射随本轮产物）
+                let tool_alias: Option<std::collections::HashMap<String, String>> = if sanitize {
+                    wb_payload::apply_tool_alias_forward(&mut converted, &tool_alias_rules)
+                } else {
+                    None
+                };
+                // 残指纹自检（issue #122 方案 C3，同流式路径口径：按请求去重）
+                if sanitize {
+                    if let Some(note) =
+                        wb_payload::residual_fingerprint_note_rules_bytes(&converted, &tool_alias_rules)
+                    {
+                        if last_residual_note.as_deref() != Some(note.as_str()) {
+                            last_residual_note = Some(note.clone());
+                            state.logger.log_debug_line(format!(
+                                "[DEBUG] 残指纹自检命中: {note} pool={} uid={}",
+                                state.pool_label(),
+                                picked.uid
+                            ));
+                        }
+                    }
+                }
+
+                // F-76① 各轮记首字耗时（最终轮即最终回复的 TTFT）
+                let ttfb_start = Instant::now();
+                match wb_upstream::make_wb_request(&creds, &conv_id, &converted) {
+                    Ok(reader) => {
+                        // P2-2：tracked 行源 + 槽——聚合 EOF 掐断可识别，截断响应
+                        // 不得当成功交付（代执行场景会拿到残缺 tool_calls）
+                        let read_slot = wb_upstream::new_read_err_slot();
+                        let lines = match wb_upstream::lines_with_first_byte_timeout_tracked(reader, read_slot.clone()) {
+                            Ok(l) => l,
+                            Err(()) => {
+                                note_wb_error(&state, &picked.uid, &model, ErrKind::Server, None, None);
+                                break Err("上游首字超时".to_string());
+                            }
+                        };
+                        last_ttfb_ms = Some(ttfb_start.elapsed().as_millis() as u64);
+                        let (completion, error_info) =
+                            wb_sse::aggregate(lines, &format!("chatcmpl-{}", now_ts()), tool_alias.as_ref());
+                        // P2-2：读错误槽合并——掐断丢弃部分响应，按轮失败处理
+                        let (completion, error_info) =
+                            aggregate_with_transport_cut(completion, error_info, &read_slot);
+                        if let Some((code, msg)) = error_info {
+                            // 传输层掐断（issue #158 P2-2）：账号无关传输故障——
+                            // 不冷却账号/模型；本轮按上游失败如实失败（不伪装成功）
+                            if super::is_transport_cut(code, &msg) {
+                                state.logger.log_request_ttfb(
+                                    state.pool_label(), "POST", "/v1/responses", &model, stream, 200, &picked.uid,
+                                    start_ts.elapsed().as_millis() as u64, last_ttfb_ms, &key_name,
+                                    &state.route_pool().name_of(&picked.uid), Some(&msg),
+                                );
+                                *safe_lock(&state.last_error) =
+                                    Some(format!("wb-toolexec uid={} code={} msg={}", picked.uid, code, msg));
+                                break Err(msg);
+                            }
+                            // 11128 流内形态（issue #123）：口径同下方 Err 分支——
+                            // round 回退重跑当前轮（不消耗轮次，下一轮循环顶部
+                            // 按新 sanitize 重建请求体）；已清洗仍命中 → 落指纹
+                            // 样本后按原路径换号（不冷却：指纹拦截与账号无关）
+                            if code == 11128 || super::retry::is_illegal_channel_error(&msg) {
+                                // issue #195：升级守卫改为 force_aggressive 未置位——
+                                // wb_sanitize 默认开时旧守卫 `!sanitize` 恒假，首轮
+                                // 11128 即 break Err Fatal（口径同流式/聚合路径）
+                                if !force_aggressive {
+                                    sanitize = true;
+                                    state.logger.log_sched_event(&format!(
+                                        "11128 强制清洗重试（流内）{}", wb_payload::template_hit_note()
+                                    ));
+                                    round = round.saturating_sub(1);
+                                    force_aggressive = true;
+                                    std::thread::sleep(std::time::Duration::from_millis(200));
+                                    continue;
+                                }
+                                let sample = wb_payload::fingerprint_sample(
+                                    &serde_json::to_vec(&chat_body).unwrap_or_default(),
+                                );
+                                if last_11128_sample.as_deref() != Some(sample.as_str()) {
+                                    last_11128_sample = Some(sample.clone());
+                                    log_and_record_11128(
+                                        &state, &sample, &converted, &tool_alias_rules, hit_cursor,
+                                        Some((&creds, &model)),
+                                    );
+                                    state.logger.log_sched_event(
+                                        "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
+                                    );
+                                }
+                                *safe_lock(&state.last_error) = Some(format!(
+                                    "wb-toolexec uid={} code={} msg={}", picked.uid, code, msg
+                                ));
+                                break Err(msg);
+                            }
+                            let kind = classify_wb_error(code, &msg);
+                            if kind != ErrKind::None {
+                                // issue #206：SoftRate 记账号×模型冷却对（不钉账号级
+                                // until），其余维持既有分账（口径同流式路径）
+                                note_wb_error(&state, &picked.uid, &model, kind, Some(&msg), None);
+                            }
+                            *safe_lock(&state.last_error) =
+                                Some(format!("wb-toolexec uid={} code={} msg={}", picked.uid, code, msg));
+                            break Err(msg);
+                        }
+                        let Some(completion) = completion else {
+                            break Err("上游返回空响应".to_string());
+                        };
+                        if super::aggregated_response_is_empty(&completion) {
+                            // 空完成（影子风控/上游异常，issue #57）：换号重试。
+                            // 口径：同流式路径不冷却（哨兵注释见 mod.rs）；此处补即时
+                            // 观测日志，接通「空完成 → 模板命中」反查通道（与其余路径一致）
+                            empty_hits += 1;
+                            let duration_ms = start_ts.elapsed().as_millis() as u64;
+                            state.logger.log_request_ttfb(
+                                state.pool_label(), "POST", "/v1/responses", &model, stream, 502, &picked.uid,
+                                duration_ms, last_ttfb_ms, &key_name,
+                                &state.route_pool().name_of(&picked.uid),
+                                Some(&format!("空完成 → 换号重试{}", wb_payload::template_hit_note())),
+                            );
+                            break Err("空完成（影子风控/上游异常）".to_string());
+                        }
+                        if let Some(u) = completion.get("usage") {
+                            // 宽口径提取（别名 + 字符串数字形态，审查 P2）；
+                            // 同步累加请求级口径（审查 P1：失败终局带上真实消耗）
+                            let (pt, ct) = u64_pair(u);
+                            acc_usage = (acc_usage.0 + pt, acc_usage.1 + ct);
+                            req_acc_usage = (req_acc_usage.0 + pt, req_acc_usage.1 + ct);
+                            acc_cached += cached_tokens_of(u);
+                            acc_cache_write += cache_write_tokens_of(u);
+                        }
+                        // P1-6：仅代理成功注入工具时才按名提取代执行调用；
+                        // 客户端同名工具的调用一律视为普通透传（不提取不执行）
+                        let calls = if proxy_exec {
+                            super::wb_toolexec::extract_proxy_calls(&completion)
+                        } else {
+                            Vec::new()
+                        };
+                        if calls.is_empty() {
+                            // 最终回复：usage 写回全部轮次累加值（中间轮消耗计入总账）
+                            let mut completion = completion;
+                            match completion.get_mut("usage") {
+                                Some(u) => {
+                                    write_back_acc_usage(u, acc_usage, acc_cached, acc_cache_write)
+                                }
+                                None => {
+                                    completion["usage"] = json!({
+                                        "prompt_tokens": acc_usage.0,
+                                        "completion_tokens": acc_usage.1,
+                                        "cache_read_token": acc_cached,
+                                        "cache_write_token": acc_cache_write,
+                                    });
+                                }
+                            }
+                            break Ok(completion); // 最终回复
+                        }
+                        // 本地代执行 + 回喂
+                        let mut tool_msgs: Vec<Value> = Vec::new();
+                        let assistant_msg = completion
+                            .pointer("/choices/0/message")
+                            .cloned()
+                            .unwrap_or_else(|| json!({}));
+                        for (call_id, name, args) in &calls {
+                            let (output, ok) = super::wb_toolexec::execute(name, args);
+                            let query = serde_json::from_str::<Value>(args)
+                                .ok()
+                                .and_then(|a| {
+                                    a.get("query")
+                                        .or_else(|| a.get("url"))
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_string)
+                                })
+                                .unwrap_or_default();
+                            records.push(super::wb_toolexec::SearchRecord {
+                                tool: name.clone(),
+                                query,
+                                ok,
+                            });
+                            tool_msgs.push(json!({
+                                "role": "tool",
+                                "tool_call_id": call_id,
+                                "content": output,
+                            }));
+                        }
+                        if let Some(msgs) = chat_body
+                            .get_mut("messages")
+                            .and_then(|m| m.as_array_mut())
+                        {
+                            msgs.push(assistant_msg);
+                            msgs.extend(tool_msgs);
+                        }
+                        continue;
+                    }
+                    Err((status, resp_body, retry_after)) => {
+                        // 11128 渠道风控（issue #57）：清洗未启用时强制清洗后重试
+                        // （round 回退，不消耗轮次；下一轮循环顶部按新 sanitize 重建请求体）
+                        if status == 400 && super::retry::is_illegal_channel_error(&resp_body) {
+                            // issue #195：升级守卫改为 force_aggressive 未置位（口径同流内分支）
+                            if !force_aggressive {
+                                sanitize = true;
+                                state.logger.log_sched_event(&format!(
+                                    "11128 强制清洗重试{}", wb_payload::template_hit_note()
+                                ));
+                                round = round.saturating_sub(1);
+                                // aggressive 升级（issue #122 缺口3）：11128 显式指纹
+                                // 确认 → round 回退重跑 prepare 时激进规则一并生效
+                                force_aggressive = true;
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                                continue;
+                            }
+                            // 清洗已启用仍命中（issue #99 诊断闭环）：落原始指纹样本
+                            // + 按请求去重；Fatal 透传前附排查指引（仅日志）
+                            let sample = wb_payload::fingerprint_sample(
+                                &serde_json::to_vec(&chat_body).unwrap_or_default(),
+                            );
+                            if last_11128_sample.as_deref() != Some(sample.as_str()) {
+                                last_11128_sample = Some(sample.clone());
+                                log_and_record_11128(
+                                    &state, &sample, &converted, &tool_alias_rules, hit_cursor,
+                                    Some((&creds, &model)),
+                                );
+                                state.logger.log_sched_event(
+                                    "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
+                                );
+                            }
+                        }
+                        match retry_plan(status, &resp_body, same_attempt, retry_after) {
+                            RetryAction::RetrySame { delay_ms } => {
+                                same_attempt += 1;
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    delay_ms.min(60_000),
+                                ));
+                                continue;
+                            }
+                            RetryAction::SwitchKey => {
+                                if status == 401 && !refreshed.contains(&picked.uid) {
+                                    refreshed.insert(picked.uid.clone());
+                                    match wb_upstream::refresh_access_token_for(&state.data_dir, &picked.uid, Some(&creds.token), state.buddy_ai) {
+                                        Ok(new_token) => {
+                                            state.route_pool().update_jwt(&picked.uid, &new_token);
+                                            creds.token = new_token;
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            *safe_lock(&state.last_error) = Some(format!(
+                                                "wb-toolexec refresh uid={} err={}",
+                                                picked.uid, e
+                                            ));
+                                            // 他方进程刷新中：以 Err 收束本轮 outcome（跳过
+                                            // classify_error→note_error 防误置 disabled），外层
+                                            // 换号重试；对方刷新结果由下轮请求持锁双检复用
+                                            if e == wb_upstream::ERR_PEER_REFRESHING {
+                                                break Err(format!(
+                                                    "wb-toolexec refresh uid={} 他方进程正在刷新，本轮换号",
+                                                    picked.uid
+                                                ));
+                                            }
+                                            // 审查修复（第五轮）：传输层瞬时失败同上分流——
+                                            // 「刷新请求失败:」前缀为网络/响应异常，换号不 classify
+                                            if e.starts_with("刷新请求失败") {
+                                                break Err(format!(
+                                                    "wb-toolexec refresh uid={} 刷新暂时失败，本轮换号",
+                                                    picked.uid
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                                let kind = classify_wb_http_error(status, &resp_body);
+                                if kind != ErrKind::None {
+                                    // issue #159：kind=None（4001 模型配置不匹配）不冷却，对齐流内路径；
+                                    // issue #206：SoftRate 记账号×模型冷却对（不钉账号级 until）；
+                                    // 其余类别维持既有账号级/模型级分账（口径同流式路径）
+                                    let upstream = upstream_msg(&resp_body);
+                                    note_wb_error(&state, &picked.uid, &model, kind,
+                                        upstream.as_deref(), retry_after);
+                                }
+                                break Err(format!("upstream {} error: {}", status, safe_slice(&resp_body, 200)));
+                            }
+                            RetryAction::Fatal => {
+                                break Err(format!("upstream {} error: {}", status, safe_slice(&resp_body, 300)));
+                            }
+                        }
+                    }
+                }
+            };
+
+            match outcome {
+                Ok(c) => {
+                    state.route_pool().note_success(&picked.uid);
+                    clear_model_failure(&state, &model);
+                    // issue #206：成功请求解除该账号×该模型的冷却对
+                    clear_account_model_cooldown(&state, &picked.uid, &model);
+                    success_uid = Some(picked.uid.clone());
+                    final_completion = Some(c);
+                    break 'accounts;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    continue; // 换号
+                }
+            }
+        }
+
+        let duration_ms = start_ts.elapsed().as_millis() as u64;
+        match final_completion {
+            Some(mut completion) => {
+                // 宽口径提取（别名 + 字符串数字形态，审查 P2）；
+                // completion 写回值为最终账号跨轮累加（acc_usage），维持不变
+                let (pt, ct) = completion.get("usage").map(u64_pair).unwrap_or((0, 0));
+                let usage_uid = success_uid.as_deref().unwrap_or("wb-toolexec");
+                // M4 审查修复：缓存读 tokens 旁路入账——聚合终态 usage 经
+                // write_back_acc_usage 写回 cache_read_token，cached_tokens_of
+                // 键集覆盖该键可直接提取；未下发得 0 不入账
+                state.record_usage_cached(
+                    state.usage_bucket(),
+                    completion.get("usage").map(cached_tokens_of).unwrap_or(0),
+                );
+                // F-76① TTFT 入账：最终轮首字耗时
+                state.record_usage_bucket_ttfb(state.usage_bucket(), &model, usage_uid, &key_id, true, stream, duration_ms, pt, ct, last_ttfb_ms);
+                state.logger.log_request_ttfb(
+                    state.pool_label(), "POST", "/v1/responses", &model, stream, 200, usage_uid,
+                    duration_ms, last_ttfb_ms, &key_name, &state.route_pool().name_of(usage_uid),
+                    Some(&format!("rounds={} searches={}", records.len(), records.iter().filter(|r| r.tool == super::wb_toolexec::TOOL_SEARCH).count())),
+                );
+                // Responses 投影：web_search_call 历史项前置
+                completion["model"] = json!(model.clone());
+                let ws_items = super::wb_toolexec::search_call_items(&records, &resp_id);
+                Ok((completion, ws_items, resp_id))
+            }
+            None => {
+                // 失败终局带上请求级真实消耗（审查 P1：跨账号跨轮次已消耗的
+                // tokens 原硬编码 0,0 全部丢弃，含失败账号与中间轮回喂）
+                state.record_usage_bucket(state.usage_bucket(), &model, "wb-toolexec", &key_id, false, stream, duration_ms, req_acc_usage.0, req_acc_usage.1);
+                state.logger.log_request(
+                    state.pool_label(), "POST", "/v1/responses", &model, stream, 502, "wb-toolexec",
+                    duration_ms, &key_name, "", last_err.as_deref(),
+                );
+                // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
+                Err(last_err.unwrap_or_else(|| {
+                    let (healthy_total, _) = state.route_pool().selectable_stats_in(None, false);
+                    let (hard_credit_cnt, _) = state.route_pool().hard_credit_stats();
+                    let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message(
+                        state.pool_label(),
+                        empty_hits,
+                        tried.len(),
+                        healthy_total,
+                        hard_credit_cnt,
+                    );
+                    // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导才标记
+                    super::wb_payload::mark_channel_fp_block(
+                        state.pool_label(),
+                        exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK",
+                    );
+                    // issue #99 ①：影子风控收尾落原始指纹样本（chat_body 轮末已追加
+                    // tool 消息，样本取首条 system + 工具清单，语义不受影响）
+                    if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
+                        state.logger.log_debug_line(format!(
+                            "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool={} 指纹样本: {}",
+                            tried.len(),
+                            empty_hits,
+                            state.pool_label(),
+                            wb_payload::fingerprint_sample(
+                                &serde_json::to_vec(&chat_body).unwrap_or_default()
+                            ),
+                        ));
+                    }
+                    exhaust_msg
+                }))
+            }
+        }
+    })
+    .await;
+
+    let (final_completion, ws_items, resp_id) = match result {
+        Ok(Ok(t)) => t,
+        Ok(Err(msg)) => {
+            return openai_error(StatusCode::BAD_GATEWAY, "tool_exec_error", &msg);
+        }
+        Err(e) => {
+            return openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                &format!("task join error: {}", e),
+            );
+        }
+    };
+
+    let resp_obj = {
+        let mut r = super::wb_responses::completion_to_responses(&final_completion, &resp_id, &model, &encoded);
+        if !ws_items.is_empty() {
+            let mut output = ws_items;
+            if let Some(old) = r.get("output").and_then(|o| o.as_array()).cloned() {
+                output.extend(old);
+            }
+            r["output"] = json!(output);
+        }
+        r
+    };
+
+    if stream {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        // 由聚合结果合成 Responses SSE 事件序列（created → items → completed）
+        tokio::task::spawn_blocking(move || {
+            let send = |event: &str, data: &Value| {
+                let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                    "event: {}\ndata: {}\n\n",
+                    event, data
+                ))));
+            };
+            let mut created = resp_obj.clone();
+            created["status"] = json!("in_progress");
+            created["output"] = json!([]);
+            send("response.created", &json!({"type": "response.created", "response": created}));
+            let output_items = resp_obj.get("output").and_then(|o| o.as_array()).cloned().unwrap_or_default();
+            for (i, item) in output_items.iter().enumerate() {
+                send("response.output_item.added", &json!({
+                    "type": "response.output_item.added",
+                    "output_index": i,
+                    "item": item,
+                }));
+                // message 文本增量（整段一次下发，聚合投影无逐 token 流）
+                if item.get("type").and_then(|v| v.as_str()) == Some("message") {
+                    if let Some(text) = item
+                        .pointer("/content/0/text")
+                        .and_then(|t| t.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        send("response.output_text.delta", &json!({
+                            "type": "response.output_text.delta",
+                            "item_id": item.get("id").cloned().unwrap_or(json!("")),
+                            "output_index": i,
+                            "content_index": 0,
+                            "delta": text,
+                        }));
+                    }
+                }
+                // function_call 参数增量
+                if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
+                    if let Some(args) = item.get("arguments").and_then(|a| a.as_str()).filter(|s| !s.is_empty()) {
+                        send("response.function_call_arguments.delta", &json!({
+                            "type": "response.function_call_arguments.delta",
+                            "item_id": item.get("id").cloned().unwrap_or(json!("")),
+                            "output_index": i,
+                            "delta": args,
+                        }));
+                    }
+                }
+                send("response.output_item.done", &json!({
+                    "type": "response.output_item.done",
+                    "output_index": i,
+                    "item": item,
+                }));
+            }
+            send("response.completed", &json!({"type": "response.completed", "response": resp_obj}));
+        });
+        let stream = ReceiverStream::new(rx);
+        Response::builder()
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .header("connection", "keep-alive")
+            .body(Body::from_stream(stream))
+            .unwrap_or_else(|_| internal_error_response())
+    } else {
+        Response::builder()
+            .header("content-type", "application/json")
+            .body(Body::from(resp_obj.to_string()))
+            .unwrap_or_else(|_| internal_error_response())
+    }
+}
+
+// ==================== 小工具 ====================
+
+fn send_stream_error_wb(
+    tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    proto: Protocol,
+    model: &str,
+    // 数字 HTTP 状态码（400/上游 status）或字符串业务码（no_healthy_account，
+    // 池耗尽出口 main 审查 #7 客户端兼容口径）——OpenAI 臂按原值透传不变形
+    code: serde_json::Value,
+    msg: &str,
+) {
+    // 统一实现收敛到 routes::send_stream_error_full（审查 #2：wb/qoder/routes
+    // 三套同构实现合一，Responses 骨架与 Anthropic 收口加固三池一致）
+    crate::api_server::routes::send_stream_error_full(tx, proto, model, code, msg);
+}
+
+fn internal_error_response() -> Response {
+    Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .body(Body::from("{\"error\":{\"message\":\"internal error\"}}"))
+        .unwrap()
+}
+
+/// 字符边界安全截断（审查 P2-2）：字节落点在多字节字符内时回退到前一个边界，
+/// 而非返回整个串（避免超长上游响应体整段进入错误消息/日志）
+fn safe_slice(s: &str, n: usize) -> &str {
+    if let Some(t) = s.get(..n) {
+        return t;
+    }
+    // n 落在字符边界内：向前找最近的合法边界（最多回退 3 字节，UTF-8 最长 4 字节）
+    let mut end = n.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// 多轮累计 usage 写回：prompt/completion/total 汇总 + 缓存读/写跨轮累计写回。
+/// 先清除上游单轮残留的遮蔽键再写累计值——cached_tokens_of /
+/// cache_write_tokens_of 宽口径优先读顶层别名与嵌套容器
+/// （prompt_tokens_details / inputTokensDetails），任何正值残留都会让下游读到
+/// 单轮值而遮蔽跨轮累计值；写侧别名同理——末轮单轮 cache_creation 残留会被
+/// 下游误读为全程累计（首轮写入通常最大，少报最明显）。
+fn write_back_acc_usage(
+    u: &mut Value,
+    acc_usage: (u64, u64),
+    acc_cached: u64,
+    acc_cache_write: u64,
+) {
+    u["prompt_tokens"] = json!(acc_usage.0);
+    u["completion_tokens"] = json!(acc_usage.1);
+    if u.get("total_tokens").is_some() {
+        u["total_tokens"] = json!(acc_usage.0 + acc_usage.1);
+    }
+    if let Some(obj) = u.as_object_mut() {
+        // 顶层键：宽口径全部别名（含 cache_read_token / cache_write_token
+        // 自身，下方重写累计值）
+        for k in [
+            "cache_read_input_tokens",
+            "cache_read_token",
+            "cacheReadInputTokens",
+            "prompt_cache_hit_tokens",
+            "cached_tokens",
+            "cache_read_tokens",
+            "cache_creation_input_tokens",
+            "cache_write_input_tokens",
+            "cacheWriteInputTokens",
+            "prompt_cache_write_tokens",
+        ] {
+            obj.remove(k);
+        }
+        // 嵌套容器整体移除：cached_tokens_of 的兜底来源，残留即遮蔽
+        obj.remove("prompt_tokens_details");
+        obj.remove("inputTokensDetails");
+    }
+    u["cache_read_token"] = json!(acc_cached);
+    u["cache_write_token"] = json!(acc_cache_write);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 池耗尽/取号失败 Responses 错误帧字段集：官方 SDK Response 模型对
+    /// created_at/model/parallel_tool_calls 等有必读要求（审查 #2 先补 created_at
+    /// 只补一半，缺 model 仍整帧反序列化失败被吞为连接错误），必须复用
+    /// responses_object 骨架保证字段完整，且错误帧不带 usage
+    #[test]
+    fn send_stream_error_wb_responses_frame_carries_sdk_required_fields() {
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        send_stream_error_wb(
+            &tx,
+            crate::api_server::routes::Protocol::Responses,
+            "glm-5.3-flash",
+            json!(503),
+            "无健康账号",
+        );
+        drop(tx);
+        let frame = rx.try_recv().expect("Responses 臂应发出恰好一帧");
+        let text = String::from_utf8_lossy(&frame.unwrap()).to_string();
+        assert!(
+            text.starts_with("event: response.failed\n"),
+            "帧头应为 response.failed 事件：{text}"
+        );
+        let data = text
+            .strip_prefix("event: response.failed\ndata: ")
+            .and_then(|rest| rest.strip_suffix("\n\n"))
+            .expect("帧体应为 SSE data 行");
+        let body: serde_json::Value = serde_json::from_str(data).expect("data 应为合法 JSON");
+        assert_eq!(body["type"], "response.failed");
+        let resp = &body["response"];
+        assert_eq!(resp["object"], "response");
+        assert_eq!(resp["status"], "failed");
+        assert_eq!(resp["model"], "glm-5.3-flash");
+        assert!(resp["created_at"].is_number(), "created_at 为 SDK 必读字段");
+        assert_eq!(resp["parallel_tool_calls"], true);
+        assert_eq!(resp["tool_choice"], "auto");
+        assert!(resp["tools"].is_array());
+        assert!(resp["output"].is_array());
+        assert_eq!(resp["error"]["code"], "503");
+        assert!(
+            resp["error"]["message"].as_str().unwrap_or("").contains("无健康账号"),
+            "error.message 应承载错误详情"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "错误帧只发一次，且不带 usage/[DONE] 收尾"
+        );
+    }
+
+    /// 池耗尽出口（main 审查 #7）：code 保持字符串 no_healthy_account 客户端兼容
+    /// ——OpenAI 臂 data 帧字符串 code 原样透传 + [DONE] 收尾；Responses 臂
+    /// error.code 直通字符串；Anthropic 臂 event: error 后补 message_stop 合成
+    /// 收口（docker 审查 #2 同族，防等待收口的客户端挂死）。审查修复（批次 2）：
+    /// 收口不再带 message_delta——delta.stop_reason 无「错误」官方枚举值，合成值
+    /// 会被严格 SDK 拒验；event:error 已进入错误分支，message_stop 仅终止流
+    #[test]
+    fn send_stream_error_wb_string_code_and_anthropic_closure() {
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+
+        // OpenAI 臂：字符串 code 原样透传 + [DONE] 收尾
+        send_stream_error_wb(
+            &tx,
+            crate::api_server::routes::Protocol::OpenAi,
+            "glm-5.3-flash",
+            json!("no_healthy_account"),
+            "无健康账号",
+        );
+        drop(tx);
+        let frame = String::from_utf8_lossy(&rx.try_recv().expect("OpenAI 臂应有错误帧").unwrap())
+            .to_string();
+        let body: serde_json::Value = serde_json::from_str(
+            frame
+                .strip_prefix("data: ")
+                .and_then(|rest| rest.strip_suffix("\n\n"))
+                .expect("帧体应为 SSE data 行"),
+        )
+        .expect("data 应为合法 JSON");
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(
+            body["error"]["code"], "no_healthy_account",
+            "字符串 code 必须原样透传（客户端兼容口径）"
+        );
+        let done = String::from_utf8_lossy(
+            &rx.try_recv()
+                .expect("OpenAI 臂应有 [DONE] 收尾")
+                .unwrap(),
+        )
+        .to_string();
+        assert_eq!(done, "data: [DONE]\n\n");
+        assert!(rx.try_recv().is_err(), "OpenAI 臂应恰好两帧");
+
+        // Responses 臂：字符串 code 直通 error.code（as_str 分支）
+        let (tx2, mut rx2) =
+            tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        send_stream_error_wb(
+            &tx2,
+            crate::api_server::routes::Protocol::Responses,
+            "glm-5.3-flash",
+            json!("no_healthy_account"),
+            "无健康账号",
+        );
+        drop(tx2);
+        let f2 = String::from_utf8_lossy(&rx2.try_recv().expect("Responses 臂应有错误帧").unwrap())
+            .to_string();
+        let body2: serde_json::Value = serde_json::from_str(
+            f2.strip_prefix("event: response.failed\ndata: ")
+                .and_then(|rest| rest.strip_suffix("\n\n"))
+                .expect("帧体应为 SSE data 行"),
+        )
+        .expect("data 应为合法 JSON");
+        assert_eq!(body2["response"]["error"]["code"], "no_healthy_account");
+
+        // Anthropic 臂：error + message_stop 合成收口（不带 message_delta——
+        // delta.stop_reason 无「错误」官方枚举值，严格 SDK 会拒验）
+        let (tx3, mut rx3) =
+            tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        send_stream_error_wb(
+            &tx3,
+            crate::api_server::routes::Protocol::Anthropic,
+            "glm-5.3-flash",
+            json!("no_healthy_account"),
+            "无健康账号",
+        );
+        drop(tx3);
+        let f3 = String::from_utf8_lossy(&rx3.try_recv().expect("Anthropic 臂应有 error 帧").unwrap())
+            .to_string();
+        assert!(f3.starts_with("event: error\ndata: "), "首帧应为 error 事件：{f3}");
+        let f4 = String::from_utf8_lossy(
+            &rx3.try_recv()
+                .expect("Anthropic 臂应有合成收口帧")
+                .unwrap(),
+        )
+        .to_string();
+        assert!(
+            f4.contains("event: message_stop") && f4.contains("\"type\":\"message_stop\""),
+            "收口包应含 message_stop 终止事件：{f4}"
+        );
+        assert!(
+            !f4.contains("message_delta"),
+            "收口不得带 message_delta（stop_reason 无错误枚举，严格 SDK 拒验）：{f4}"
+        );
+        assert!(rx3.try_recv().is_err(), "Anthropic 臂应恰好两包");
+    }
+
+    #[test]
+    fn merge_transport_cut_info_overrides_placeholder_only() {
+        // 槽空（正常完成/桥接未及拉取）：error_info 原样保留
+        let empty_slot = wb_upstream::new_read_err_slot();
+        assert!(merge_transport_cut_info(None, &empty_slot).is_none());
+        let business = Some((11128i64, "illegal channel".into()));
+        assert_eq!(
+            merge_transport_cut_info(business.clone(), &empty_slot).unwrap().0,
+            11128
+        );
+
+        // 槽有读错误：None → 哨兵
+        let slot = wb_upstream::new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some("h2 RST_STREAM".into());
+        let merged = merge_transport_cut_info(None, &slot).expect("掐断必须上抛哨兵");
+        assert!(crate::api_server::is_transport_cut(merged.0, &merged.1));
+
+        // 槽有读错误：空完成哨兵被覆盖（不计 empty_hits）
+        let slot = wb_upstream::new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some("h2 RST_STREAM".into());
+        let empty = Some((
+            crate::api_server::EMPTY_COMPLETION_CODE,
+            crate::api_server::EMPTY_COMPLETION_MSG.to_string(),
+        ));
+        let merged = merge_transport_cut_info(empty, &slot).expect("覆盖空完成占位");
+        assert!(crate::api_server::is_transport_cut(merged.0, &merged.1));
+
+        // 槽有读错误：业务错误优先保留（不被覆盖）
+        let slot = wb_upstream::new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some("h2 RST_STREAM".into());
+        let business = Some((11128i64, "illegal channel".into()));
+        assert_eq!(
+            merge_transport_cut_info(business, &slot).unwrap().0,
+            11128,
+            "业务错误不得被掐断哨兵覆盖"
+        );
+    }
+
+    #[test]
+    fn aggregate_with_transport_cut_discards_partial_resp() {
+        // 掐断 + 无业务错误 → 丢弃部分响应，改写哨兵（换号路径）
+        let slot = wb_upstream::new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some("h2 RST_STREAM".into());
+        let partial = Some(serde_json::json!({"choices": [{"delta": {}}]}));
+        let (resp, err) = aggregate_with_transport_cut(partial, None, &slot);
+        assert!(resp.is_none(), "截断的部分响应必须丢弃");
+        let (code, msg) = err.expect("掐断必须转错误通道");
+        assert!(crate::api_server::is_transport_cut(code, &msg));
+
+        // 正常完成（槽空）→ 原样
+        let empty_slot = wb_upstream::new_read_err_slot();
+        let full = Some(serde_json::json!({"choices": []}));
+        let (resp, err) = aggregate_with_transport_cut(full.clone(), None, &empty_slot);
+        assert_eq!(resp, full);
+        assert!(err.is_none());
+
+        // 业务错误已存在 → 保留（含部分响应为 None 的常规错误形态）
+        let slot = wb_upstream::new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some("h2 RST_STREAM".into());
+        let (resp, err) =
+            aggregate_with_transport_cut(None, Some((11128i64, "illegal".into())), &slot);
+        assert!(resp.is_none());
+        assert_eq!(err.unwrap().0, 11128);
+
+        // 零内容掐断（审查修复）：aggregate 先落空完成哨兵 → 必须覆盖为掐断
+        // 哨兵，不得计入空完成指纹口径（否则轮换耗尽可误判指纹拦截）
+        let slot = wb_upstream::new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some("connection reset by peer".into());
+        let (resp, err) = aggregate_with_transport_cut(
+            None,
+            Some((
+                crate::api_server::EMPTY_COMPLETION_CODE,
+                crate::api_server::EMPTY_COMPLETION_MSG.to_string(),
+            )),
+            &slot,
+        );
+        assert!(resp.is_none());
+        let (code, msg) = err.expect("掐断须覆盖空完成哨兵");
+        assert!(crate::api_server::is_transport_cut(code, &msg));
+        assert!(!crate::api_server::is_empty_completion(code, &msg));
+    }
+
+    /// M3 回归锁：槽内读错误按掐断特征分流——掐断特征（RST_STREAM/连接重置）
+    /// → -9902（账号无关免冷却）；非掐断特征（读超时等）→ -9903 Server 口径
+    /// 哨兵（可被 classify_wb_error 归 Server，恢复账号质量熔断），且同样
+    /// 覆盖空完成哨兵（截断不计空完成指纹）
+    #[test]
+    fn read_error_sentinel_classifies_by_transport_cut_text() {
+        use crate::api_server::wb_upstream::new_read_err_slot;
+        // 掐断特征 → -9902
+        let slot = new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some("h2 RST_STREAM pushed".into());
+        let s = crate::api_server::read_error_sentinel_from_slot(&slot).expect("掐断错误应出哨兵");
+        assert!(crate::api_server::is_transport_cut(s.0, &s.1), "实际: {s:?}");
+        assert!(!crate::api_server::is_transport_read_err(s.0, &s.1));
+        // 非掐断特征（读超时）→ -9903，且 classify_wb_error 归 Server（冷却恢复）
+        let slot = new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some("timed out reading response".into());
+        let s = crate::api_server::read_error_sentinel_from_slot(&slot).expect("读超时应出哨兵");
+        assert!(crate::api_server::is_transport_read_err(s.0, &s.1), "实际: {s:?}");
+        assert!(!crate::api_server::is_transport_cut(s.0, &s.1));
+        assert!(
+            matches!(classify_wb_error(s.0, &s.1), ErrKind::Server),
+            "读超时哨兵必须走 Server 冷却口径"
+        );
+        // 聚合路径：读错误哨兵同样覆盖空完成（截断不得计空完成指纹）
+        let slot = new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some("timed out reading response".into());
+        let empty = Some((
+            crate::api_server::EMPTY_COMPLETION_CODE,
+            crate::api_server::EMPTY_COMPLETION_MSG.to_string(),
+        ));
+        let (resp, err) = aggregate_with_transport_cut(None, empty, &slot);
+        assert!(resp.is_none(), "截断的部分响应必须丢弃");
+        let (code, msg) = err.expect("读错误必须覆盖空完成哨兵");
+        assert!(crate::api_server::is_transport_read_err(code, &msg));
+        assert!(!crate::api_server::is_empty_completion(code, &msg));
+    }
+
+    #[test]
+    fn classify_wb_error_ranges() {
+        assert!(matches!(classify_wb_error(401, "x"), ErrKind::SessionDead));
+        assert!(matches!(classify_wb_error(429, "x"), ErrKind::SoftRate));
+        assert!(matches!(classify_wb_error(503, "x"), ErrKind::Server));
+        // 未识别 4xx 归 Client（10m 短冷却），不误触 30m 熔断
+        assert!(matches!(classify_wb_error(400, "bad request"), ErrKind::Client));
+        assert!(matches!(classify_wb_error(404, "nope"), ErrKind::Client));
+        // 未知业务码（<400）维持 Server 保守判定
+        assert!(matches!(classify_wb_error(0, "weird"), ErrKind::Server));
+        // message 关键词优先级不受 code 分段影响
+        assert!(matches!(classify_wb_error(200, "积分不足"), ErrKind::HardCredit));
+        // 11140 账号级风控（issue #136 反馈）：流内 code / 关键词均 → Forbidden
+        assert!(matches!(classify_wb_error(11140, "x"), ErrKind::Forbidden));
+        assert!(matches!(
+            classify_wb_error(200, "系统检测到该账号存在异常使用行为，如需申诉请提交反馈"),
+            ErrKind::Forbidden
+        ));
+        // 与渠道级 11128 互不误撞
+        assert!(!matches!(classify_wb_error(11128, "request illegal"), ErrKind::Forbidden));
+        // 4054「模型请求失败，请稍后重试」（issue #212/#151）：瞬态过载 →
+        // SoftRate 60s 短冷却，不得落兜底 Client 10 分钟误杀健康账号
+        assert!(matches!(classify_wb_error(4054, "x"), ErrKind::SoftRate));
+        assert!(matches!(
+            classify_wb_error(0, "模型请求失败，请稍后重试。"),
+            ErrKind::SoftRate
+        ));
+        // 数字边界：40540 不命中 4054 识别（落既有 >=500 分段 Server）
+        assert!(matches!(classify_wb_error(40540, "x"), ErrKind::Server));
+        // 复合文案优先级：关键词分类（HardCredit/SessionDead）优先于
+        // 「请稍后重试」短语兜底，不得被劫持改判 SoftRate
+        assert!(matches!(
+            classify_wb_error(200, "积分不足，请稍后重试"),
+            ErrKind::HardCredit
+        ));
+        // M3 审查收口：读错误哨兵显式归 Server——io 文本关键词不得把 -9903
+        // 误降级 SoftRate（现实样本 "Too many open files" 命中 "too many"）
+        assert!(matches!(
+            classify_wb_error(-9903, "transport read error: Too many open files"),
+            ErrKind::Server
+        ));
+        assert!(matches!(
+            classify_wb_error(
+                -9903,
+                "transport read error: length limit exceeded while reading"
+            ),
+            ErrKind::Server
+        ));
+    }
+
+    /// 6004 限额文案 → 精确恢复时刻（agent2api errors.rs 同源语义；
+    /// UTC+8 字面量必须命中，按 UTC+8 解释为 Unix 秒）
+    #[test]
+    fn parse_quota_reset_at_from_limit_message() {
+        // 未来时刻动态构造（UTC+8 时区格式化），格式与上游文案一致
+        let reset = (chrono::Utc::now() + chrono::Duration::hours(3))
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());
+        let msg = format!(
+            "当前模型使用额度已达上限，将在 {} UTC+8 重置",
+            reset.format("%Y-%m-%d %H:%M:%S")
+        );
+        let ts = parse_quota_reset_at(&msg).expect("应解析出恢复时刻");
+        assert_eq!(ts, reset.timestamp());
+        // 缺 UTC+8 字面量 / 缺时刻 → None
+        assert_eq!(parse_quota_reset_at("将在 2099-01-01 00:00:00 重置"), None);
+        assert_eq!(parse_quota_reset_at("quota exceeded"), None);
+        // 过去时刻 → None（落回渐进退避）
+        assert_eq!(parse_quota_reset_at("已在 2020-01-01 00:00:00 UTC+8 重置"), None);
+        // 超远未来（>7 天钳制）→ None
+        let far = (chrono::Utc::now() + chrono::Duration::days(30))
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());
+        let far_msg = format!("将在 {} UTC+8 重置", far.format("%Y-%m-%d %H:%M:%S"));
+        assert_eq!(parse_quota_reset_at(&far_msg), None);
+        // 复审修复回归：双时刻文案（触发时刻为过去 + 恢复时刻为未来）→
+        // 首锚点解析出过去时刻须跳过，继续用第二锚点解析出恢复时刻
+        let past = (chrono::Utc::now() - chrono::Duration::hours(2))
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());
+        let dual = format!(
+            "您于 {} UTC+8 触发限额，将在 {} UTC+8 重置",
+            past.format("%Y-%m-%d %H:%M:%S"),
+            reset.format("%Y-%m-%d %H:%M:%S")
+        );
+        assert_eq!(parse_quota_reset_at(&dual), Some(reset.timestamp()));
+    }
+
+    /// issue #159：账号级解冻时刻解析——绝对形态与 parse_quota_reset_at 同源；
+    /// 相对秒形态覆盖中英文锚点；不可解析落 None（调用方回退固定时长冷却）
+    #[test]
+    fn parse_account_unfreeze_at_absolute_and_relative() {
+        // ① 绝对形态：与 parse_quota_reset_at 完全同源
+        let reset = (chrono::Utc::now() + chrono::Duration::hours(3))
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());
+        let abs_msg = format!(
+            "当前模型使用额度已达上限，将在 {} UTC+8 重置",
+            reset.format("%Y-%m-%d %H:%M:%S")
+        );
+        assert_eq!(
+            parse_account_unfreeze_at(&abs_msg),
+            parse_quota_reset_at(&abs_msg)
+        );
+        assert_eq!(parse_account_unfreeze_at(&abs_msg), Some(reset.timestamp()));
+        // ② 相对秒：中文锚点（含空格变体）与英文 after/in 秒单位锚点
+        // （区间断言容忍 now 采样与内部 now_ts 的秒级推进）
+        let now = now_ts();
+        for (msg, expect) in [
+            ("30秒后重试", 30i64),
+            ("30 秒后重试", 30),
+            ("45s后恢复", 45),
+            ("after 45s", 45),
+            ("retry after 45 seconds", 45),
+            ("retry in 20 seconds", 20),
+        ] {
+            let ts = parse_account_unfreeze_at(msg).unwrap_or_else(|| panic!("应解析: {msg}"));
+            assert!(
+                (expect..=expect + 5).contains(&(ts - now)),
+                "相对秒偏差: {msg} got {}",
+                ts - now
+            );
+            assert!(ts > now, "必须在未来: {msg}");
+        }
+        // ③ 不可解析 → None
+        assert_eq!(parse_account_unfreeze_at("quota exceeded"), None);
+        assert_eq!(parse_account_unfreeze_at("upstream 500 error"), None);
+        // ④ 审查修复回归：s 开头非秒词不误判（单位须完整词形 + 词边界）
+        assert_eq!(parse_account_unfreeze_at("done in 10 steps"), None);
+        assert_eq!(parse_account_unfreeze_at("quota exceeded after 5 sessions"), None);
+        assert_eq!(parse_account_unfreeze_at("ok in 2 sets"), None);
+        // ⑤ 小数/千分位片段不命中（digits_before 分隔符守卫）
+        assert_eq!(parse_account_unfreeze_at("3.5s后重试"), None);
+        assert_eq!(parse_account_unfreeze_at("3.5秒后重试"), None);
+        assert_eq!(parse_account_unfreeze_at("1,500秒后重试"), None);
+        // ⑥ 完整词形秒单位仍命中（大小写不敏感 + 词边界放行标点/结尾）
+        let now2 = now_ts();
+        for (msg, expect) in [
+            ("after 30 secs", 30i64),
+            ("try in 45 SECONDS", 45),
+            ("after 1 sec", 1),
+            ("10s后恢复", 10),
+            // 审查修复回归：中英文锚点大小写不敏感（大写 S/After/In 变体命中）
+            ("30S后恢复", 30),
+            ("After 30 Seconds", 30),
+            ("try IN 20 s", 20),
+        ] {
+            let ts = parse_account_unfreeze_at(msg).unwrap_or_else(|| panic!("应解析: {msg}"));
+            assert!(
+                (expect..=expect + 5).contains(&(ts - now2)),
+                "相对秒偏差: {msg} got {}",
+                ts - now2
+            );
+        }
+    }
+
+    /// upstream_msg 三种字段形态（message / error.message / msg）提取
+    #[test]
+    fn upstream_msg_field_variants() {
+        assert_eq!(
+            upstream_msg(r#"{"code":6004,"message":"将在 2099-01-01 00:00:00 UTC+8 重置"}"#).as_deref(),
+            Some("将在 2099-01-01 00:00:00 UTC+8 重置")
+        );
+        assert_eq!(
+            upstream_msg(r#"{"error":{"code":6004,"message":"限额"}}"#).as_deref(),
+            Some("限额")
+        );
+        assert_eq!(upstream_msg(r#"{"code":6004,"msg":"腾讯系 msg 字段"}"#).as_deref(), Some("腾讯系 msg 字段"));
+        assert_eq!(upstream_msg("not json"), None);
+        assert_eq!(upstream_msg("{}"), None);
+    }
+
+    /// 多轮累计 usage 写回：累计值写入 + 残留遮蔽键清除（读侧与写侧）+ 宽口径回读一致
+    #[test]
+    fn write_back_acc_usage_clears_shadow_keys_and_writes_acc() {
+        let mut u = serde_json::json!({
+            "prompt_tokens": 5,
+            "completion_tokens": 2,
+            "total_tokens": 7,
+            "cache_read_input_tokens": 3,
+            "cache_read_token": 4,
+            "cacheReadInputTokens": 8,
+            "prompt_cache_hit_tokens": 9,
+            "cached_tokens": 6,
+            "cache_read_tokens": 1,
+            "prompt_tokens_details": {"cached_tokens": 10},
+            "inputTokensDetails": [{"cached_tokens": 11}],
+            "cache_creation_input_tokens": 12,
+            "cache_write_input_tokens": 13,
+            "cacheWriteInputTokens": 14,
+            "prompt_cache_write_tokens": 15,
+        });
+        write_back_acc_usage(&mut u, (15, 7), 42, 17);
+        assert_eq!(u["prompt_tokens"], serde_json::json!(15));
+        assert_eq!(u["completion_tokens"], serde_json::json!(7));
+        assert_eq!(u["total_tokens"], serde_json::json!(22));
+        // 宽口径回读命中累计值，而非任何残留单轮值
+        assert_eq!(cached_tokens_of(&u), 42);
+        assert_eq!(cache_write_tokens_of(&u), 17);
+        // 遮蔽键全部清除，仅剩累计值载体 cache_read_token / cache_write_token
+        for k in [
+            "cache_read_input_tokens",
+            "cacheReadInputTokens",
+            "prompt_cache_hit_tokens",
+            "cached_tokens",
+            "cache_read_tokens",
+            "prompt_tokens_details",
+            "inputTokensDetails",
+            "cache_creation_input_tokens",
+            "cache_write_input_tokens",
+            "cacheWriteInputTokens",
+            "prompt_cache_write_tokens",
+        ] {
+            assert!(u.get(k).is_none(), "残留遮蔽键 {k}");
+        }
+        assert_eq!(u["cache_read_token"], serde_json::json!(42));
+        assert_eq!(u["cache_write_token"], serde_json::json!(17));
+    }
+
+    /// usage 原本无 total_tokens 时保持缺省，不强加字段
+    #[test]
+    fn write_back_acc_usage_keeps_total_absent() {
+        let mut u = serde_json::json!({"prompt_tokens": 1, "completion_tokens": 1});
+        write_back_acc_usage(&mut u, (3, 4), 0, 0);
+        assert_eq!(u["prompt_tokens"], serde_json::json!(3));
+        assert_eq!(u["completion_tokens"], serde_json::json!(4));
+        assert!(u.get("total_tokens").is_none());
+        assert_eq!(u["cache_read_token"], serde_json::json!(0));
+        assert_eq!(u["cache_write_token"], serde_json::json!(0));
+    }
+
+    /// 预算耗尽判定（issue #213 阶段2）：budget=0 旧行为恒耗尽；rounds 达 budget 耗尽
+    #[test]
+    fn budget_exhausted_boundaries() {
+        assert!(budget_exhausted(3, 0), "budget=0 = 旧行为，耗尽直接收尾");
+        assert!(!budget_exhausted(3, 6));
+        assert!(budget_exhausted(6, 6));
+        assert!(budget_exhausted(7, 6), "超预算必耗尽（防越界重开）");
+        assert!(!budget_exhausted(0, 6), "空 tried 首轮不判耗尽");
+    }
+
+    /// 预算重开轮换判定（issue #213 阶段2）：冷却账号保留、非冷却账号清空、
+    /// 全部冷却中（无状态变化）→ None 落耗尽收尾防空转
+    #[test]
+    fn budget_retry_round_keeps_cooldown_and_detects_stall() {
+        let shared = Arc::new(crate::api_server::test_shared_state(std::env::temp_dir().join(
+            "wb_route_budget_retry_test",
+        )));
+        let state = WbView::wb(shared);
+        let model = "gpt-test";
+        let tried: HashSet<String> = ["wb-a".to_string(), "wb-b".to_string()].into_iter().collect();
+
+        // 预算 0（旧行为）→ 不重开
+        assert!(budget_retry_round(&state, &tried, model, 3, 0).is_none());
+
+        // 两账号均未冷却（503 Server 不记账号×模型冷却）→ 全部清空重开（§5.4
+        // 全黑窗口语义：黑窗内重轮换同样三账号，靠退避跨窗，非空转）
+        let next0 = budget_retry_round(&state, &tried, model, 3, 9).expect("有非冷却账号必须重开");
+        assert!(next0.is_empty(), "非冷却账号全部清空（下一轮可重选）");
+
+        // 一账号进冷却（SoftRate 账号×模型冷却）→ 冷却账号保留在 tried（pick 继续
+        // 排除，不烧已判定不可用的号），非冷却账号清空（可被 pick 重选）
+        note_account_model_cooldown(&state, "wb-a", model, now_ts() + 120);
+        let next = budget_retry_round(&state, &tried, model, 3, 9).expect("有冷却变化必须重开");
+        assert!(next.contains("wb-a"), "冷却中的账号必须保留（pick 继续排除它）");
+        assert!(!next.contains("wb-b"), "非冷却账号必须清空（重开轮换可再选中）");
+
+        // 重开后再耗尽且 wb-a 仍在冷却、wb-b 仍未冷却 → 再次重开同样只留 wb-a
+        let tried2: HashSet<String> = ["wb-a".to_string(), "wb-b".to_string()].into_iter().collect();
+        let next2 = budget_retry_round(&state, &tried2, model, 6, 9).expect("预算未用尽仍有变化");
+        assert_eq!(next2.len(), 1);
+        assert!(next2.contains("wb-a"));
+        assert!(!next2.contains("wb-b"));
+
+        // 全部已试账号均进冷却 → 无可重试候选，落耗尽收尾防空转
+        note_account_model_cooldown(&state, "wb-b", model, now_ts() + 120);
+        assert!(budget_retry_round(&state, &tried2, model, 6, 9).is_none());
+
+        // rounds 达 budget → 不再重开
+        assert!(budget_retry_round(&state, &tried, model, 9, 9).is_none());
+    }
+
+    /// 重开退避：base 2s × 轮次封顶 15s，抖动 ±25% 不越界
+    #[test]
+    fn budget_backoff_ms_bounds() {
+        // round=1 → base 2s，抖动 ±25% = [1.5s, 2.5s)
+        let ms = budget_backoff_ms(1);
+        assert!(ms >= 1_500 && ms < 2_500);
+        // round=2 → base 4s，抖动 [3s, 5s)
+        let ms = budget_backoff_ms(2);
+        assert!(ms >= 3_000 && ms < 5_000);
+        // 封顶：round=100 → base 封顶 15s，抖动 [11.25s, 18.75s)
+        let ms = budget_backoff_ms(100);
+        assert!(ms >= 11_250 && ms < 18_750);
+    }
+}
+

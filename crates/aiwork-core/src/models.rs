@@ -1,0 +1,839 @@
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+#[derive(Serialize, Clone, Default)]
+pub struct AccountView {
+    pub user_id: String,
+    pub name: String,
+    pub group_id: Option<String>,
+    pub jwt: String,
+    pub jwt_exp_hours: Option<f64>,
+    pub jwt_exp_timestamp: Option<i64>,
+    pub checked_today: Option<bool>,
+    pub credits: Option<i64>,
+    pub remaining_credits: Option<f64>,
+    pub device_id_masked: Option<String>,
+    pub cooldown_type: Option<String>,
+    pub cooldown_until: Option<i64>,
+    pub cooldown_reason: Option<String>,
+    pub has_refresh_token: bool,
+    pub jwt_auto_refresh: bool,
+    pub credits_expire_at: Option<i64>,
+    /// 通用积分（product_id != 209）剩余
+    #[serde(default)]
+    pub general_credits: Option<f64>,
+    /// Work 积分（product_id == 209）剩余
+    #[serde(default)]
+    pub work_credits: Option<f64>,
+    /// 本周期积分包总额度（有效积分包 credits_limit 合计，到期日历「剩余 X / 总 Y」口径）
+    #[serde(default)]
+    pub total_credits: Option<f64>,
+    /// 套餐身份（Free / Lite / Pro ...，来自 ide_user_pay_status 缓存）
+    #[serde(default)]
+    pub pay_identity: Option<String>,
+    /// 会员套餐到期时间（Unix 秒，来自 ent_usage 会员包）
+    #[serde(default)]
+    pub membership_expire: Option<i64>,
+    /// 会员套餐下次自动续费时间（Unix 秒，无自动续费为 None）
+    #[serde(default)]
+    pub membership_next_billing: Option<i64>,
+    /// refresh_token 过期时间（Unix 秒；上游未下发则为 None）——F-78 批次 3 生命周期管理
+    #[serde(default)]
+    pub refresh_token_expires_at: Option<i64>,
+    /// refresh_token 连续刷新失败次数（刷新成功清零）
+    #[serde(default)]
+    pub refresh_token_fails: i32,
+    /// refresh_token 是否已判定失效（连续 3 次失败或服务端明确拒绝；重新 OAuth 登录重置）
+    #[serde(default)]
+    pub refresh_token_invalid: bool,
+    /// 凭证（JWT/refresh_token）最近一次落盘时间（OAuth 登录/导入/刷新成功时更新；
+    /// F-78 批次 3 收尾，对齐 Buddy 侧 auth_saved_at 先例）
+    #[serde(default)]
+    pub auth_saved_at: Option<String>,
+    /// 共享标签 tag id 列表（从 account_tags 表联表填充，不落账号持久化结构，D3）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct RawAccount {
+    pub name: String,
+    #[serde(rename = "UserID", default)]
+    pub user_id: Option<String>,
+    pub jwt: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub added_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    /// 账户中心（icube-dc）id。实测为本机设备/数据中心级标识（跨账号恒定，不具备账号区分度），
+    /// 仅记录预留供未来与外部数据源对账合并，不参与去重/合并/展示（用户确认 2026-09-07）
+    #[serde(rename = "DcID", default)]
+    pub dc_id: Option<String>,
+    /// refresh_token 过期时间（Unix 秒；上游未下发则为 None）——F-78 批次 3 生命周期管理，
+    /// 对齐 Buddy 侧 refresh_token_expires_at 先例；serde default 保证旧数据文件不破坏
+    #[serde(default)]
+    pub refresh_token_expires_at: Option<i64>,
+    /// refresh_token 连续刷新失败次数（刷新成功清零）
+    #[serde(default)]
+    pub refresh_token_fails: i32,
+    /// refresh_token 是否已判定失效（连续 3 次失败或服务端明确拒绝；重新 OAuth 登录重置）
+    #[serde(default)]
+    pub refresh_token_invalid: bool,
+    /// 凭证最近一次落盘时间（OAuth 登录/导入/刷新成功时更新，仅展示用途）
+    #[serde(default)]
+    pub auth_saved_at: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+pub struct AccountsFile {
+    pub accounts: Vec<RawAccount>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Group {
+    pub id: String,
+    pub name: String,
+    pub color: String,
+    #[serde(default)]
+    pub order: i32,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+pub struct GroupsFile {
+    pub groups: Vec<Group>,
+    #[serde(default)]
+    pub membership: HashMap<String, String>,
+}
+
+/// 共享标签定义（跨池一张表，与 Group 同构；id 前缀 tag_）
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Tag {
+    pub id: String,
+    pub name: String,
+    pub color: String,
+    #[serde(default)]
+    pub order: i32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct DeviceEntry {
+    pub device_id: String,
+    #[serde(default)]
+    pub market_user_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+pub type DeviceMap = HashMap<String, DeviceEntry>;
+
+#[derive(Serialize, Deserialize, Default)]
+pub struct Settings {
+    #[serde(default = "default_port")]
+    pub proxy_port: u16,
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    /// 桌面版专属（启动后最小化到托盘）：Web/Docker 版无窗口系统，全树无读取方；
+    /// 仅 settings 兼容解析保留，勿在新代码引用
+    #[serde(default)]
+    pub launch_minimized: bool,
+    /// 启动静默签到（T11）：启动 60s 后对未签到账号自动执行一轮签到
+    #[serde(default)]
+    pub silent_checkin: bool,
+    #[serde(default = "default_true")]
+    pub auto_start_proxy: bool,
+    /// 桌面版专属（系统托盘开关）：Web/Docker 版无托盘概念，全树无读取方；
+    /// 仅 settings 兼容解析保留，勿在新代码引用
+    #[serde(default = "default_true")]
+    pub tray: bool,
+    #[serde(default = "default_lang")]
+    pub language: String,
+    #[serde(default = "default_true")]
+    pub checkin_skip_checked: bool,
+    #[serde(default = "default_true")]
+    pub checkin_skip_expired: bool,
+    #[serde(default = "default_retry")]
+    pub retry: i32,
+    #[serde(default = "default_notify")]
+    pub notify: String,
+    #[serde(default)]
+    pub trae_cn_path: Option<String>,
+    /// 豆包桌面版 exe 手动路径（环境配置页持久化；app_locate doubao 档案读取）
+    #[serde(default)]
+    pub doubao_path: Option<String>,
+    /// 豆包会话续期保活端点（探活巡检用；KeepAlive 不依赖此项；空值由 state 迁移回填默认）
+    #[serde(default)]
+    pub doubao_renew_url: Option<String>,
+    /// 豆包会员额度接口（会员额度汇总 XHR；空 = 额度查询不可用，由 state 迁移回填默认）
+    #[serde(default)]
+    pub doubao_quota_url: Option<String>,
+    /// 豆包快照可选纳入 Default/IndexedDB（C4：对话历史等完整状态随账号迁移；体积代价大，默认排除）
+    #[serde(default)]
+    pub doubao_snapshot_include_idb: bool,
+    /// WorkBuddy 桌面版 exe 手动路径（切换桥 workbuddy 档案 settings_key；环境配置页持久化）
+    #[serde(default)]
+    pub workbuddy_path: Option<String>,
+    /// CodeBuddy 桌面版 exe 手动路径（app_locate codebuddy 档案 settings_key）
+    #[serde(default)]
+    pub codebuddy_path: Option<String>,
+    /// WorkBuddy auth 文件人工路径（默认 %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info；
+    /// 非默认安装布局时在环境配置页指定）
+    #[serde(default)]
+    pub wb_auth_file_path: Option<String>,
+    #[serde(default)]
+    pub data_dir: Option<String>,
+    #[serde(default = "default_retention")]
+    pub log_retention_days: i32,
+    #[serde(default = "default_proxy_domains")]
+    pub proxy_domains: String,
+    #[serde(default)]
+    pub proxy_log_path: Option<String>,
+    #[serde(default = "default_api_port")]
+    pub api_port: u16,
+    #[serde(default = "default_api_model")]
+    pub api_default_model: String,
+    /// F-74：Buddy（WorkBuddy/CodeBuddy）切换账号时自动把当前账号会话迁移到目标账号
+    ///（默认关；开启后切换前自动备份当前账号三件套并复制到目标账号名下）
+    #[serde(default)]
+    pub buddy_switch_migrate_chats: bool,
+    /// WebUI 免令牌访问（安全与管理页开关，默认关）：开启后管理面 API 跳过
+    /// Cookie 鉴权，浏览器打开即进主界面；受信任内网专用，公网部署应保持关闭
+    #[serde(default)]
+    pub web_auth_disabled: bool,
+    /// Trae 签到多账号间隔秒（默认 3s，防上游频控；环境配置页可改，0 = 关闭间隔）。
+    /// None = 未配置按默认（Settings::default() 路径同款，state 不做零值回填）
+    #[serde(default)]
+    pub trae_checkin_gap_secs: Option<u64>,
+    /// WorkBuddy 签到/成长多账号间隔秒（默认 3s；任务配置页可改，0 = 关闭；
+    /// 签到与成长两轮共用同一配置）
+    #[serde(default)]
+    pub wb_checkin_gap_secs: Option<u64>,
+    /// Qoder 签到多账号间隔秒（默认 3s，任务配置页可改，0 = 关闭）
+    #[serde(default)]
+    pub qoder_checkin_gap_secs: Option<u64>,
+    // ── Buddy 国际版（buddy-ai）每日活跃打卡（移植 main f5f2cd3..61cc245） ──
+    /// buddy-ai 打卡调度开关（默认关——国际档显式开启制，与 buddy_ai_enabled 独立；
+    /// BuddyAI 页打卡卡可开）
+    #[serde(default)]
+    pub buddy_ai_checkin_enabled: bool,
+    /// buddy-ai 打卡调度触发时刻 HH:MM（默认 09:20，对齐外部项目口径）
+    #[serde(default = "default_buddy_ai_checkin_hhmm")]
+    pub buddy_ai_checkin_hhmm: String,
+    /// buddy-ai 打卡多账号间隔秒（默认 3s，0 = 关闭；复用 effective_checkin_gap）
+    #[serde(default)]
+    pub buddy_ai_checkin_gap_secs: Option<u64>,
+    // ── Buddy 国际版定时同步/续期（对齐国内任务配置口径） ──
+    /// buddy-ai 积分数据每日定时同步开关（默认开——对齐国内看板同步口径；
+    /// 仅同步 buddy-ai 池内账号，空池静默跳过）
+    #[serde(default = "default_true")]
+    pub buddy_ai_credits_sync_enabled: bool,
+    /// buddy-ai 积分同步触发时刻 HH:MM（默认 23:45，错峰 wb 23:30 / trae 23:40）
+    #[serde(default = "default_buddy_ai_credits_sync_hhmm")]
+    pub buddy_ai_credits_sync_hhmm: String,
+    /// buddy-ai 积分同步模式：off | hourly（每小时）| every_hours（每N小时）|
+    /// every_days（每N天）| daily（每日 HH:MM）。空 = 旧数据（只有 enabled 布尔），
+    /// state 归一化按旧开关派生 daily/off
+    #[serde(default)]
+    pub buddy_ai_credits_sync_mode: String,
+    /// buddy-ai 积分同步间隔小时数（every_hours 模式生效，默认 2，1..=24）
+    #[serde(default = "default_credits_sync_hours")]
+    pub buddy_ai_credits_sync_hours: String,
+    /// buddy-ai 积分同步间隔天数（every_days 模式生效，默认 1，1..=30）
+    #[serde(default = "default_credits_sync_days")]
+    pub buddy_ai_credits_sync_days: String,
+    /// buddy-ai 凭证兜底续期开关（默认开；lazy 48h——AT 到期前 48h 内才真正刷新）
+    #[serde(default = "default_true")]
+    pub buddy_ai_renew_enabled: bool,
+    /// buddy-ai 模型目录每日同步开关（默认开；直连拉取，无账号静默跳过）
+    #[serde(default = "default_true")]
+    pub buddy_ai_catalog_sync_enabled: bool,
+    /// buddy-ai 凭证兜底续期触发时刻 HH:MM（默认 10:35，错峰打卡 09:20）
+    #[serde(default = "default_buddy_ai_renew_hhmm")]
+    pub buddy_ai_renew_hhmm: String,
+    /// buddy-ai 模型目录同步触发时刻 HH:MM（默认 05:55；资源调度页可改）
+    #[serde(default = "default_buddy_ai_catalog_sync_hhmm")]
+    pub buddy_ai_catalog_sync_hhmm: String,
+    // ── 侧边栏应用显示（仅 UI 偏好：隐藏不停功能、不删数据、不影响计划任务） ──
+    /// 固定应用：始终显示在侧边栏且不可隐藏（radio 单选，默认 trae）
+    #[serde(default = "default_pinned_app")]
+    pub pinned_app: String,
+    /// 侧边栏隐藏的应用 key 列表（空 = 全部显示；固定应用即使列入也强制显示）
+    #[serde(default)]
+    pub hidden_apps: Vec<String>,
+    /// 侧边栏应用自定义图标（应用 key → 图标名，前端 lib/appIcons.ts 候选表；
+    /// 缺失/非法回退 APP_TABS 内置默认图标）
+    #[serde(default)]
+    pub app_icons: HashMap<String, String>,
+    /// 侧边栏应用显示顺序（AppKey 列表，按用户拖拽后的顺序存储；空/缺省 = 内置默认
+    /// 顺序；未提及的应用由前端按默认顺序补在末尾，新版本新增应用对老配置天然兼容）
+    #[serde(default)]
+    pub app_order: Vec<String>,
+    /// BuddyAI（buddy-ai 国际版）应用 Tab 显示开关（默认 false = 不展示）：
+    /// 独立于 hidden_apps——存量用户 hidden_apps 已持久化为 []，若借道隐藏列表
+    /// 无法区分「默认隐藏」与「用户显式取消隐藏」，故用独立 opt-in 字段；
+    /// 系统设置-应用显示面板勾选后置 true（移植 main f5f2cd3..61cc245）
+    #[serde(default)]
+    pub buddy_ai_visible: bool,
+    /// 会话明细概述显示开关（issue #82 T6.1，默认开；关闭仅隐藏 UI 展示，不删存量缓存）
+    #[serde(default = "default_true")]
+    pub sessions_preview_enabled: bool,
+}
+
+/// 侧边栏应用合法 key 白名单（单一来源）：app_order 写入侧（settings_set C4 校验）
+/// 与 app_order / app_icons 读取侧（state.rs 归一）共用，杜绝多处硬编码漂移——
+/// 新增应用时仅需改此处与前端 APP_TABS。hidden_apps 读取侧有意不用本谓词：
+/// buddy-ai 可见性走独立 opt-in 开关 buddy_ai_visible，不进隐藏列表（见 state.rs）
+pub fn is_valid_app_key(k: &str) -> bool {
+    matches!(k, "trae" | "buddy" | "qoder" | "buddy-ai")
+}
+
+fn default_api_port() -> u16 {
+    7864
+}
+fn default_api_model() -> String {
+    "deepseek-v4-flash".into()
+}
+/// 侧边栏固定应用默认 trae（主应用与回退项）
+fn default_pinned_app() -> String {
+    "trae".into()
+}
+/// 签到多账号间隔默认 3s（Trae/Buddy/Qoder 共用默认；防上游频控）
+fn default_checkin_gap_secs() -> u64 {
+    3
+}
+/// 签到间隔生效值：未配置按默认 3s，上限 clamp 600s（误填超大值防呆，0 合法 = 关闭）
+pub fn effective_checkin_gap(v: Option<u64>) -> u64 {
+    v.unwrap_or_else(default_checkin_gap_secs).min(600)
+}
+
+/// buddy-ai 打卡调度默认 09:20（对齐外部项目 scheduler 口径）
+fn default_buddy_ai_checkin_hhmm() -> String {
+    "09:20".into()
+}
+/// buddy-ai 积分同步默认 23:45（错峰 wb 23:30 / trae 23:40 / qoder 23:40）
+fn default_buddy_ai_credits_sync_hhmm() -> String {
+    "23:45".into()
+}
+/// buddy-ai 积分同步 every_hours 模式默认间隔（小时）
+fn default_credits_sync_hours() -> String {
+    "2".into()
+}
+/// buddy-ai 积分同步 every_days 模式默认间隔天数
+fn default_credits_sync_days() -> String {
+    "1".into()
+}
+/// buddy-ai 凭证兜底续期默认 10:35（错峰打卡 09:20 / wb-renew 10:30）
+fn default_buddy_ai_renew_hhmm() -> String {
+    "10:35".into()
+}
+/// buddy-ai 模型目录同步默认 05:55（错峰 wb-catalog 05:45 / qoder 05:50 / 打卡 09:20）
+fn default_buddy_ai_catalog_sync_hhmm() -> String {
+    "05:55".into()
+}
+
+fn default_port() -> u16 {
+    8899
+}
+fn default_theme() -> String {
+    "system".into()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_lang() -> String {
+    "zh-CN".into()
+}
+fn default_retry() -> i32 {
+    1
+}
+fn default_notify() -> String {
+    "toast".into()
+}
+fn default_retention() -> i32 {
+    30
+}
+/// 解密域名白名单默认值（Charles SSL Proxying Locations 语义：列表内 MITM 解密，
+/// 其余透明直通）。完整覆盖字节系九组域；带证书锁定的客户端域（豆包 ttnet 原生栈）
+/// 由自适应降级兜底：连续 3 次握手被客户端中止自动转透明直通（重启代理复位）。
+pub fn default_proxy_domains() -> String {
+    "trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com".into()
+}
+
+/// 旧版默认域名列表（未含 doubao.com）：用于把升级前已持久化的旧默认无缝迁移到新默认
+pub fn legacy_proxy_domains() -> String {
+    "trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com".into()
+}
+
+/// 上一版默认域名列表（含 doubao.com 宽后缀）：该版本会让豆包客户端 ttnet 原生栈
+/// 的证书锁定域全部被 MITM 拒绝（页面空白/接口挂），迁移到新默认（用户自定义过则不动）
+pub fn legacy_proxy_domains_with_doubao() -> String {
+    "trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com".into()
+}
+
+/// 中间版默认域名列表（过度收窄版：移出了 zijieapi.com）：zijieapi 实测可正常
+/// MITM 且 Trae 抓包需要，迁移回新默认（用户自定义过则不动）
+pub fn legacy_proxy_domains_narrow() -> String {
+    "trae.cn,trae.com.cn,mchost.guru,www.doubao.com,accounts.doubao.com".into()
+}
+
+/// 豆包保活端点默认值：GET /info/v2/（通知未读数，轻量、必须登录，200=有效 / 302=过期）。
+/// 实测字节 passport 为 30 天滑动续期（服务端按会话活跃内部刷新，不回发新 cookie），
+/// 探活只需携带凭证访问一个"必须登录"的轻量端点即可判定有效性。
+pub fn default_doubao_renew_url() -> String {
+    "https://www.doubao.com/info/v2/".into()
+}
+
+/// 豆包会员额度接口默认值：POST /alice/commerce/sale/subscription/quota/summary/
+/// （请求体 {"product_line":"membership"}，200 JSON 会员额度汇总；代理日志实测确认）
+pub fn default_doubao_quota_url() -> String {
+    "https://www.doubao.com/alice/commerce/sale/subscription/quota/summary/".into()
+}
+
+/// 旧版保活端点默认值（doubao.com 首页）：升级时迁移到新默认
+pub fn legacy_doubao_renew_url() -> String {
+    "https://www.doubao.com/".into()
+}
+
+#[derive(Serialize, Deserialize, Default)]
+pub struct CreditRecord {
+    pub date: String,
+    pub user_id: String,
+    pub credits: i64,
+    #[serde(default)]
+    pub delta: i64,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+pub struct CreditsFile {
+    pub records: Vec<CreditRecord>,
+}
+
+/// 每日积分快照：记录当天所有账号的积分总数、获得数、消耗数
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct CreditsDailySnapshot {
+    pub date: String,
+    pub total: f64,
+    pub earned: f64,
+    pub consumed: f64,
+    /// 逐账号 earned 维度（uid → 当日获得积分；issue #82 问题4-1：
+    /// 看板「区间总获得」按分组/账号筛选时用此维度求和）。
+    /// 空 map = 老快照行无账号明细（前端筛选时该日不计入过滤后合计并如实标注）。
+    #[serde(default)]
+    pub accounts: std::collections::BTreeMap<String, f64>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+pub struct CreditsDailyFile {
+    #[serde(default)]
+    pub snapshots: Vec<CreditsDailySnapshot>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+pub struct CheckinSummary {
+    #[serde(default)]
+    pub time: Option<String>,
+    #[serde(default)]
+    pub results: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub total_ok: i32,
+    #[serde(default)]
+    pub already: i32,
+    #[serde(default)]
+    pub failed: i32,
+}
+
+/// 剩余积分缓存文件：user_id -> 剩余积分
+#[derive(Serialize, Deserialize, Default)]
+pub struct RemainingCreditsFile {
+    #[serde(default)]
+    pub credits: HashMap<String, f64>,
+    #[serde(default)]
+    pub expire_times: HashMap<String, i64>,
+    /// 通用积分（product_id != 209）剩余缓存
+    #[serde(default)]
+    pub general: HashMap<String, f64>,
+    /// 通用积分（product_id != 209）最早到期时间缓存（Unix 秒）：
+    /// API 网关调度口径（网关只扣通用积分，Work 包到期不参与，issue #28）；
+    /// None 语义 = 账号通用包长期有效/已耗尽，键缺失即无到期约束
+    #[serde(default)]
+    pub general_expire_times: HashMap<String, i64>,
+    /// Work 积分（product_id == 209）剩余缓存
+    #[serde(default)]
+    pub work: HashMap<String, f64>,
+    /// 本周期积分包总额度缓存（credits_limit 合计；到期日历「剩余 X / 总 Y」数据源）
+    #[serde(default)]
+    pub total_limit: HashMap<String, f64>,
+    /// 会员套餐到期时间缓存（Unix 秒，来自 ent_usage 会员包 end_time）
+    #[serde(default)]
+    pub membership_expire: HashMap<String, i64>,
+    /// 会员套餐下次自动续费时间缓存（Unix 秒，next_billing_time）
+    #[serde(default)]
+    pub membership_next_billing: HashMap<String, i64>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+/// 积分明细条目（仅剩余 > 0 且未过期的积分包）
+#[derive(Serialize, Clone)]
+pub struct CreditPackDetail {
+    /// "通用" | "Work"
+    pub kind: String,
+    /// 来源名称（如「每日签到」「每月登录积分」）
+    pub source: String,
+    /// 该包剩余积分 = credits_limit - usage.credits_amount
+    pub remaining: f64,
+    /// 该包总额度 credits_limit（对齐上游：到期日历 note「剩余 X / 总 Y」）；
+    /// quota.credits_limit 缺失时不产生该包，运行时恒 Some，Option 仅为前向兼容
+    /// （skip 序列化：None 时不输出 null，前端 total?: number 已兼容缺省）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<f64>,
+    /// 过期时间（Unix 秒）
+    pub expire_time: i64,
+}
+
+/// 单账号积分明细（悬浮展示用）
+#[derive(Serialize, Clone)]
+pub struct CreditDetail {
+    pub general: f64,
+    pub work: f64,
+    pub total: f64,
+    /// 按过期时间升序
+    pub packs: Vec<CreditPackDetail>,
+}
+
+/// 单个账号的冷却状态
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct CooldownEntry {
+    #[serde(rename = "type", default)]
+    pub error_type: String,
+    #[serde(default)]
+    pub until: i64,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub error_count: i32,
+}
+
+/// 冷却状态文件：account_cooldowns.json
+#[derive(Serialize, Deserialize, Default)]
+pub struct AccountCooldownsFile {
+    #[serde(default)]
+    pub cooldowns: HashMap<String, CooldownEntry>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+/// API 池配置文件：api_pool.json
+#[derive(Serialize, Deserialize)]
+pub struct ApiPoolFile {
+    /// Trae 池参与调度开关（per-pool，默认开）：关闭后 Trae 目录模型不路由
+    /// Trae 池，仅 Trae 源模型显式报错（WbDisabled/QoderDisabled 同族语义）
+    #[serde(default = "default_pool_enabled")]
+    pub trae_enabled: bool,
+    #[serde(default)]
+    pub enabled_uids: Vec<String>,
+    /// 调度策略：expire_first（默认）/ credit_first / random / weighted / p2c
+    #[serde(default)]
+    pub strategy: String,
+    /// Buddy 池调度策略（取值同上）；空 = 加权公平轮转 fair_rotation
+    ///（WB 专属默认，2026-11 修复，PR #187——改前「跟随 Trae 池」继承 expire_first 硬排序缺陷）
+    #[serde(default)]
+    pub wb_strategy: String,
+    /// Qoder 池调度策略（取值同上）；空 = 沿用 strategy（跟随 Trae 池；
+    /// 不与 Buddy 同语义——后者已改公平轮转专属默认）
+    #[serde(default)]
+    pub qoder_strategy: String,
+    /// 参与调度的分组 id 列表；空 = 不限分组
+    #[serde(default)]
+    pub group_ids: Vec<String>,
+    /// WorkBuddy 上游开关（T2.1）：开启后 WB 目录模型路由到 WB 账号池
+    #[serde(default)]
+    pub wb_enabled: bool,
+    /// 默认深度思考（T5.3/F-62）：客户端未显式请求 reasoning_effort 时默认 high
+    #[serde(default)]
+    pub wb_default_thinking: bool,
+    /// 工具代执行（T5.5/F-64）：客户端声明 web_search 类工具时代理侧代执行
+    #[serde(default = "default_true")]
+    pub wb_tool_exec: bool,
+    /// 后台任务降级（T5.6③/F-65）：标题/摘要类短请求路由到目录最低倍率模型
+    #[serde(default)]
+    pub wb_bg_downgrade: bool,
+    /// 长上下文降档（F-76④）：输入粗估 ≥100k token 的请求自动换 flash 档模型
+    #[serde(default)]
+    pub wb_longctx_downgrade: bool,
+    /// 慢请求竞速对冲阈值毫秒（F-76③）：流式首字节超阈值且有其他健康账号时
+    /// 向第二账号发对冲请求；0 = 关闭
+    #[serde(default = "default_hedge_threshold_ms")]
+    pub wb_hedge_threshold_ms: u64,
+    /// Trae 池账号并发上限（per-pool 三参数之一）：inflight ≥ 上限的账号视为
+    /// busy 不参与候选，全部 busy 时降级取 inflight 最小者；0 = 不限。
+    /// 旧版三池共用字段 account_concurrency_limit 已退役（serde 忽略旧 JSON 键，
+    /// 存量迁移见 load_pool_file_with_legacy_migration：仅 Buddy 池沿用旧共享值）
+    #[serde(default = "default_account_concurrency_limit")]
+    pub trae_account_concurrency_limit: u32,
+    /// Trae 池粘性 TTL 秒（per-pool 三参数之一）：TTL 内同会话必落同一池同账号
+    ///（上游 KV cache 复用）；旧共用字段 pool_sticky_ttl_secs 已退役
+    #[serde(default = "default_pool_sticky_ttl_secs")]
+    pub trae_pool_sticky_ttl_secs: u64,
+    /// Trae 池显式会话粘性 TTL 秒（per-pool 三参数之一）：显式 conversationId
+    /// 绑定账号的有效期（滚动续期），绑定落 sticky_bindings 表 "t:" 命名空间
+    #[serde(default = "default_sticky_ttl_secs")]
+    pub trae_sticky_ttl_secs: u64,
+    /// Trae 池慢请求竞速对冲阈值毫秒（F-76③ 同构）：流式首字节超阈值且有其他
+    /// 健康账号时向第二账号发对冲请求，先出首字者胜；0 = 关闭（默认 clamp 1s–8s）
+    #[serde(default = "default_hedge_threshold_ms")]
+    pub trae_hedge_threshold_ms: u64,
+    /// WB 显式绑定 TTL 秒（F-76②；wb_sticky 会话粘性）：覆盖原 1800s 常量
+    #[serde(default = "default_wb_sticky_ttl_secs")]
+    pub wb_sticky_ttl_secs: u64,
+    /// Buddy 池账号并发上限（per-pool 三参数之一，默认 1；0 = 不限）
+    #[serde(default = "default_account_concurrency_limit")]
+    pub wb_account_concurrency_limit: u32,
+    /// Buddy 池粘性 TTL 秒（per-pool 三参数之一，默认 300）
+    #[serde(default = "default_pool_sticky_ttl_secs")]
+    pub wb_pool_sticky_ttl_secs: u64,
+    /// Buddy 池入池白名单（wb- 前缀账号 id）：空 = 全部含凭证账号自动入池
+    /// （fail-open，对齐 Buddy 页「含凭证账号参与 WB 上游调度」语义；修复 WB 池
+    /// 因误用 Trae 共享白名单而恒空、Buddy 源永远 503 no_healthy_account 的问题）；
+    /// 非空 = 仅列表内账号参与调度
+    #[serde(default)]
+    pub wb_enabled_uids: Vec<String>,
+    /// Buddy 池分组筛选（wb_group_ids）：非空时仅纳入所选分组的 WB 账号
+    /// （未分组账号不参与，对齐 Trae 池 group_ids 的 T10 语义）；空 = 不限分组
+    #[serde(default)]
+    pub wb_group_ids: Vec<String>,
+    /// Qoder 上游开关（3.7.0 移植）：开启后 Qoder 目录模型路由到 Qoder 账号池。
+    /// docker 分支有意 default true（与上游 main 的 false 相反）：三池全链路为本
+    /// 产品线 1.4.0 主特性，Qoder 池随部署默认可用（有账号时）
+    #[serde(default = "default_true")]
+    pub qoder_enabled: bool,
+    /// Qoder 池入池白名单（qoder 账号 id）：空 = 全部含凭证账号自动入池（fail-open，
+    /// 对齐 Buddy 池 wb_enabled_uids 语义）；非空 = 仅列表内账号参与调度
+    #[serde(default)]
+    pub qoder_enabled_uids: Vec<String>,
+    /// Qoder 池慢请求竞速对冲阈值毫秒（F-80-余 v2，同 wb_hedge_threshold_ms）：
+    /// 默认 8000（对齐上游与 WB/Trae 池；此前 serde default 0 与 UI 回显 8s 不一致，
+    /// 未保存过配置时实际恒关）；0 = 关闭
+    #[serde(default = "default_hedge_threshold_ms")]
+    pub qoder_hedge_threshold_ms: u64,
+    /// Qoder 会话粘性开关（F-80-余 v2；qoder_sticky）：默认关（对齐 main）
+    #[serde(default)]
+    pub qoder_sticky_enabled: bool,
+    /// Qoder 池账号并发上限（per-pool 三参数之一，默认 1；0 = 不限）
+    #[serde(default = "default_account_concurrency_limit")]
+    pub qoder_account_concurrency_limit: u32,
+    /// Qoder 池粘性 TTL 秒（per-pool 三参数之一，默认 300）
+    #[serde(default = "default_pool_sticky_ttl_secs")]
+    pub qoder_pool_sticky_ttl_secs: u64,
+    /// Qoder 池显式会话粘性 TTL 秒（per-pool 三参数之一，默认 1800）：
+    /// 覆盖 qoder_sticky store 的 EXPLICIT_TTL_SECS 常量（旧版硬编码不可配）
+    #[serde(default = "default_sticky_ttl_secs")]
+    pub qoder_sticky_ttl_secs: u64,
+    // ── Buddy 国际版（buddy-ai）独立池 per-pool 参数（移植 main f5f2cd3..61cc245） ──
+    /// Buddy 国际版（buddy-ai）池上游开关：开启后 buddy-ai 目录模型路由到国际池。
+    /// 默认 false——dispatch「buddy-ai」档显式开启制（避免模型路由歧义，用户在
+    /// API 服务页显式开启国际档），未部署国际账号时不产生空池噪音
+    #[serde(default)]
+    pub buddy_ai_enabled: bool,
+    /// buddy-ai 显式会话粘性开关（同 qoder_sticky_enabled 口径，默认关）
+    #[serde(default)]
+    pub buddy_ai_sticky_enabled: bool,
+    /// buddy-ai 池粘性 TTL 秒（per-pool 参数，默认 300）
+    #[serde(default = "default_pool_sticky_ttl_secs")]
+    pub buddy_ai_pool_sticky_ttl_secs: u64,
+    /// buddy-ai 池账号并发上限（per-pool 三参数之一，默认 1；0 = 不限，
+    /// 对齐 Qoder 池 qoder_account_concurrency_limit 口径）
+    #[serde(default = "default_account_concurrency_limit")]
+    pub buddy_ai_account_concurrency_limit: u32,
+    /// buddy-ai 显式会话粘性 TTL 秒（per-pool 三参数之一，默认 1800）：
+    /// 覆盖 buddy_ai_sticky store 的 EXPLICIT_TTL_SECS 常量（set_explicit_ttl 热应用）
+    #[serde(default = "default_wb_sticky_ttl_secs")]
+    pub buddy_ai_sticky_ttl_secs: u64,
+    /// buddy-ai 竞速对冲阈值毫秒（per-pool 三参数之一，0 = 关闭；默认 8000，
+    /// 运行时 clamp 1s–8s 同 WB/Qoder）
+    #[serde(default = "default_hedge_threshold_ms")]
+    pub buddy_ai_hedge_threshold_ms: u64,
+    /// buddy-ai 池分组筛选（buddy_ai_group_ids）：非空时仅纳入所选分组的国际账号
+    ///（未分组账号不参与，对齐 WB/Qoder 池 T10 语义）；空 = 不限分组
+    #[serde(default)]
+    pub buddy_ai_group_ids: Vec<String>,
+    /// buddy-ai 池标签筛选（tag_ 前缀 id）：与分组筛选取交集（D5 池语义）；空 = 不限
+    #[serde(default)]
+    pub buddy_ai_tag_ids: Vec<String>,
+    /// buddy-ai 池内调度策略（取值同 strategy；空串 = 跟随 Trae 池，与
+    /// qoder_strategy 同语义——wb_strategy 已改公平轮转专属默认，不在此列）。
+    /// 启动（do_start）与热应用（pool_set）
+    /// 共用 PoolStrategy::resolve_buddy_ai 解析，保证两处行为一致
+    #[serde(default)]
+    pub buddy_ai_strategy: String,
+    /// WB 池伪流式开关（issue #213）：客户端 stream:true 时内部走聚合管线，
+    /// 成功后合成 SSE 下发——断流场景全部可无损换号重试；默认 false（旧行为）
+    #[serde(default)]
+    pub wb_pseudo_stream: bool,
+    /// buddy-ai 档伪流式开关（issue #213 同构，独立配置与 CN 档分开灰度）
+    #[serde(default)]
+    pub buddy_ai_pseudo_stream: bool,
+    /// 伪流式等待期 keep-alive 间隔秒（issue #213）：聚合期间周期性向客户端
+    /// 下发 SSE 注释帧防中间层空闲超时断连；0 = 关闭
+    #[serde(default = "default_pseudo_keepalive_secs")]
+    pub pseudo_keepalive_secs: u64,
+    /// WB 换号重试预算（issue #213 阶段2）：轮换重试次数上限；0 = 旧行为
+    /// （重试机会 = 池内账号数）
+    #[serde(default)]
+    pub wb_retry_budget: u32,
+    /// buddy-ai 档换号重试预算（issue #213 阶段2 同构，独立配置）
+    #[serde(default)]
+    pub buddy_ai_retry_budget: u32,
+    /// Qwen3.8-Flash 免费活动倍率覆盖（资源调度页模型目录开关，默认开）：
+    /// 开启时该模型目录/兜底倍率按 0 处理——/v1/models 展示 0× + 取号豁免
+    /// 零积分过滤（issue #111：上游免费活动期 billable=false 不扣分，但
+    /// model/list 目录价随低峰折扣漂移 0.1/0.08，不反映免费，需此覆盖）。
+    /// 上游活动结束后关闭即恢复官方同步倍率
+    #[serde(default = "default_true")]
+    pub qoder_flash_free_rate: bool,
+    /// Qoder 池分组筛选（Qoder 账号 group_id，共享分组体系）；空 = 不限分组
+    #[serde(default)]
+    pub qoder_group_ids: Vec<String>,
+    /// 各池标签筛选（共享标签 tag id；空 = 不限）。与分组筛选取交集（D5：
+    /// 均空 = 不限；仅一方非空 = 该维度成员集）
+    #[serde(default)]
+    pub trae_tag_ids: Vec<String>,
+    #[serde(default)]
+    pub wb_tag_ids: Vec<String>,
+    #[serde(default)]
+    pub qoder_tag_ids: Vec<String>,
+}
+
+fn default_hedge_threshold_ms() -> u64 {
+    // 与运行时 clamp(1000, 8000) 上限对齐（P1 缺陷5）：原 15s 默认超出上限，
+    // 实际等效 8s，配置展示失真
+    8_000
+}
+
+fn default_account_concurrency_limit() -> u32 {
+    1
+}
+
+fn default_pool_sticky_ttl_secs() -> u64 {
+    300
+}
+
+fn default_wb_sticky_ttl_secs() -> u64 {
+    1800
+}
+
+/// 显式会话粘性 TTL 默认值（Trae/Qoder 池 per-pool 三参数之一，与
+/// wb_sticky::EXPLICIT_TTL_SECS 30m 常量对齐）
+fn default_sticky_ttl_secs() -> u64 {
+    1800
+}
+
+/// 伪流式等待期 keep-alive 间隔秒默认值（issue #213）：5s 防中间层空闲超时
+fn default_pseudo_keepalive_secs() -> u64 {
+    5
+}
+
+/// Trae 池参与调度开关默认值：主池历史行为恒可用
+fn default_pool_enabled() -> bool {
+    true
+}
+
+/// Default 与 serde default 对齐（derive Default 的数值字段会落 0，与旧版
+/// api_pool.json 缺字段的语义不一致：F-76③ 对冲默认 8s、F-77 并发默认 1、
+/// F-76② 池粘性 300s / 会话粘性 1800s）
+impl Default for ApiPoolFile {
+    fn default() -> Self {
+        Self {
+            trae_enabled: default_pool_enabled(),
+            enabled_uids: Vec::new(),
+            strategy: String::new(),
+            wb_strategy: String::new(),
+            qoder_strategy: String::new(),
+            group_ids: Vec::new(),
+            wb_enabled: false,
+            wb_default_thinking: false,
+            wb_tool_exec: false,
+            wb_bg_downgrade: false,
+            wb_longctx_downgrade: false,
+            wb_hedge_threshold_ms: default_hedge_threshold_ms(),
+            trae_account_concurrency_limit: default_account_concurrency_limit(),
+            trae_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
+            trae_sticky_ttl_secs: default_sticky_ttl_secs(),
+            trae_hedge_threshold_ms: default_hedge_threshold_ms(),
+            wb_sticky_ttl_secs: default_wb_sticky_ttl_secs(),
+            wb_account_concurrency_limit: default_account_concurrency_limit(),
+            wb_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
+            wb_enabled_uids: Vec::new(),
+            wb_group_ids: Vec::new(),
+            qoder_enabled: true,
+            qoder_enabled_uids: Vec::new(),
+            qoder_hedge_threshold_ms: default_hedge_threshold_ms(),
+            qoder_sticky_enabled: false,
+            qoder_account_concurrency_limit: default_account_concurrency_limit(),
+            qoder_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
+            qoder_sticky_ttl_secs: default_sticky_ttl_secs(),
+            qoder_flash_free_rate: true,
+            qoder_group_ids: Vec::new(),
+            trae_tag_ids: Vec::new(),
+            wb_tag_ids: Vec::new(),
+            qoder_tag_ids: Vec::new(),
+            buddy_ai_enabled: false,
+            buddy_ai_sticky_enabled: false,
+            buddy_ai_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
+            buddy_ai_account_concurrency_limit: default_account_concurrency_limit(),
+            buddy_ai_sticky_ttl_secs: default_wb_sticky_ttl_secs(),
+            buddy_ai_hedge_threshold_ms: default_hedge_threshold_ms(),
+            buddy_ai_group_ids: Vec::new(),
+            buddy_ai_tag_ids: Vec::new(),
+            buddy_ai_strategy: String::new(),
+            wb_pseudo_stream: false,
+            buddy_ai_pseudo_stream: false,
+            pseudo_keepalive_secs: default_pseudo_keepalive_secs(),
+            wb_retry_budget: 0,
+            buddy_ai_retry_budget: 0,
+        }
+    }
+}
+
+/// 池中单个账号的运行时状态（给 /status 和前端使用）
+#[derive(Serialize, Clone)]
+pub struct PoolStatus {
+    pub uid: String,
+    pub name: String,
+    pub credits: Option<f64>,
+    pub credits_expire_at: Option<i64>,
+    pub cooling: bool,
+    pub cooldown_until: Option<i64>,
+    pub cooldown_reason: Option<String>,
+    /// hard_credit（积分耗尽）冷却中：until 次日 04:00 自动恢复探测（F-29 v1.2）。
+    /// cooling 仅覆盖 until 软冷却，此字段补齐硬冷却——否则积分耗尽账号在
+    /// 前端显示「就绪」却不可选（可观测盲点）
+    #[serde(default)]
+    pub hard_credit: bool,
+    /// 硬冷却截止时刻（Unix 秒，issue #178；hard_credit=true 时有值，前端显示恢复倒计时）
+    #[serde(default)]
+    pub hard_until: Option<i64>,
+    pub disabled: bool,
+    pub err_count: i32,
+    /// 账号五态机（T2.2/F-29 v1.2）：Available/QuotaProtection/RateLimited/Forbidden/ProxyDisabled
+    #[serde(default)]
+    pub state: String,
+    /// 账号实时在途并发数（F-77：per-account inflight，前端池状态页展示）
+    #[serde(default)]
+    pub inflight: u32,
+    /// refresh_token 是否已判定失效（F-78 批次 3：前端展示「Token 失效」徽标）
+    #[serde(default)]
+    pub refresh_invalid: bool,
+}
+
+/// API 服务整体状态（给前端用）
+#[derive(Serialize, Clone)]
+pub struct ApiServiceStatus {
+    pub running: bool,
+    pub port: u16,
+    pub total_requests: u64,
+    pub active_uid: Option<String>,
+    pub last_error: Option<String>,
+    pub started_at: Option<u64>,
+}

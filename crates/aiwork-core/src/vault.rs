@@ -1,0 +1,891 @@
+//! 敏感数据加密存储（Stronghold，Web/无桌面部署适配）。
+//!
+//! 设计：
+//! - vault 快照 `conf/vault.stronghold` 权威保存各账号 jwt / refresh_token（按 uid 一条记录）；
+//! - vault 主密码（KeyProvider，ADR-2 去 DPAPI）：
+//!   1. 环境变量 `AIWORK_VAULT_KEY` 非空 → 任意字符串 SHA-256 归一为 32 字节（Docker/跨机部署可复现）；
+//!   2. 否则读 `conf/vault_key.bin`（"V2:"+hex(32B) 格式，首启自动生成，unix 下 0600 权限）；
+//!   3. 检测到旧桌面版 DPAPI 加密 blob → 报明确迁移错误（见 parse_key_file）；
+//! - `checkin_accounts.json` 只保留占位（jwt/refresh_token 清空），其余字段（name/user_id 等）不动；
+//! - 所有账号文件读写统一走 `load_accounts` / `save_accounts`：
+//!   读：JSON 明文优先（更新鲜，如 MITM 新捕获）→ 否则从 vault 回填；
+//!   写：非空凭据先写入 vault 并落盘快照 → JSON 占位化；
+//!   vault 写失败时数据库保持原状并返回 Err（禁止明文落盘，也不销毁库中既有凭据——
+//!   issue #153 修复 1）；
+//! - Rust 签到直调后凭据全程内存传递（原 Python 脚本方案需写解密临时文件，已移除；
+//!   启动清理逻辑保留，兜底清理旧版本残留的临时凭据文件）。
+
+use std::path::Path;
+use std::sync::Mutex;
+
+use crate::fs_utils;
+use crate::models::AccountsFile;
+use crate::state::AppState;
+use iota_stronghold::{KeyProvider, SnapshotPath, Stronghold};
+use zeroize::Zeroizing;
+
+/// vault 单客户端路径（固定使用一个 client，简化存取）
+const CLIENT_PATH: &[u8] = b"main";
+
+/// 临时凭据文件名前缀（位于应用数据目录；启动时按此前缀清理残留）
+const TEMP_ACCOUNTS_PREFIX: &str = "trae_checkin_accounts_";
+
+/// 单账号凭据记录（vault 内 JSON 序列化存储）
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone, Debug, PartialEq)]
+pub struct SecretEntry {
+    #[serde(default)]
+    pub jwt: String,
+    #[serde(default)]
+    pub refresh_token: String,
+}
+
+/// vault 会话句柄：engine 句柄 + 快照路径 + 密钥提供者（快照落盘 commit 时需要）
+struct VaultHandle {
+    sh: Stronghold,
+    snapshot: SnapshotPath,
+    keyprovider: KeyProvider,
+}
+
+/// 全局 vault 句柄缓存：**按 conf_path 分桶**（懒加载）；持有锁期间完成读写 +
+/// 快照落盘，串行化访问。生产单 data_dir 恒单桶（行为同旧「进程级单例」）；
+/// 测试进程多 data_dir 并行时各目录持有独立 stronghold 实例——互不串写、
+/// 互不指向已删快照（Linux CI 曾三次因「单例被并行测试绑定到别的目录/已删
+/// 目录」导致 migrate 断言偶发失败，分桶为根治方案，见 1.4.3 CHANGELOG）。
+static VAULTS: Mutex<Vec<(std::path::PathBuf, VaultHandle)>> = Mutex::new(Vec::new());
+
+/// 生成 32 字节随机主密码（OS CSPRNG：rand OsRng，跨平台；
+/// 满足 Stronghold KeyProvider 恰好 32 字节 NC_DATA_SIZE 的要求）
+fn generate_password() -> [u8; 32] {
+    use rand::RngCore;
+    let mut buf = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    buf
+}
+
+/// KeyProvider（ADR-2，去 DPAPI，Web/无桌面部署）：
+/// 1. 环境变量 `AIWORK_VAULT_KEY` 非空（trim 后）→ 任意字符串 SHA-256 归一为 32 字节
+///    （Docker/跨机部署可复现，不依赖本机文件）；
+/// 2. 否则读 `conf/vault_key.bin`（"V2:" + hex(32B) 格式，首启自动生成，unix 下 0600 权限）；
+/// 3. 检测到旧桌面版 DPAPI 加密 blob → 返回明确迁移错误（见 parse_key_file）。
+fn vault_password(state: &AppState) -> Result<Vec<u8>, String> {
+    if let Ok(v) = std::env::var("AIWORK_VAULT_KEY") {
+        let v = v.trim();
+        if !v.is_empty() {
+            return Ok(normalize_key(v.as_bytes()).to_vec());
+        }
+    }
+    let key_path = state.conf_path("vault_key.bin");
+    if key_path.exists() {
+        let raw = std::fs::read(&key_path).map_err(|e| vault_key_io_err("读取", &key_path, e))?;
+        parse_key_file(&raw, &key_path)
+    } else {
+        let key = generate_password();
+        let content = format!("V2:{}", bytes_to_hex(&key));
+        write_key_file(&key_path, content.as_bytes())?;
+        Ok(key.to_vec())
+    }
+}
+
+/// 任意字符串密钥归一为 32 字节（SHA-256；env 密钥用，满足 NC_DATA_SIZE）
+fn normalize_key(input: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(input);
+    hasher.finalize().into()
+}
+
+/// 字节 → 小写 hex（密钥文件存储格式）
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 解析密钥文件：`V2:` 前缀 + 64 位 hex → 32 字节；
+/// 其他内容视为旧桌面版 DPAPI 二进制 blob，返回明确迁移错误。
+fn parse_key_file(raw: &[u8], path: &Path) -> Result<Vec<u8>, String> {
+    let text = String::from_utf8_lossy(raw);
+    let Some(hex) = text.trim().strip_prefix("V2:") else {
+        return Err(format!(
+            "检测到旧版桌面应用的 vault 密钥（DPAPI 加密，Web/无桌面环境无法解密）。\
+             迁移：先在桌面版导出账号 JSON（含凭据），然后删除 {} 与同目录 vault.stronghold，\
+             再重启服务并在 Web 端导入该 JSON",
+            path.display()
+        ));
+    };
+    if hex.len() != 64 {
+        return Err(format!(
+            "vault 密钥格式异常（V2: 后期望 64 位 hex，实际 {} 字符）",
+            hex.len()
+        ));
+    }
+    // hexdigit 全量校验（port main aa4ec5a issue #139 审查加固）：len() 是字节
+    // 长度，多字节 UTF-8 字符可凑足 64 字节，直接按字节切片会在 char boundary
+    // 中间 panic；先统一收敛为友好 Err（共享目录手工编辑污染场景）。
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(
+            "vault 密钥格式异常（V2: 后应为 64 位 ASCII hex，实际含非 hex 字符）".to_string(),
+        );
+    }
+    let mut key = [0u8; 32];
+    for i in 0..32 {
+        key[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|e| format!("vault 密钥 hex 解码失败: {e}"))?;
+    }
+    Ok(key.to_vec())
+}
+
+/// 写密钥文件（unix 下 0600，避免其他用户读取）
+fn write_key_file(path: &Path, content: &[u8]) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| vault_key_io_err("写入", path, e))?;
+        f.write_all(content).map_err(|e| vault_key_io_err("写入", path, e))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, content).map_err(|e| vault_key_io_err("写入", path, e))
+    }
+}
+
+/// vault 密钥文件 IO 错误映射（issue #153 修复 3）：os error 448 =
+/// ERROR_UNTRUSTED_MOUNT_POINT，典型场景是 conf 目录被改成了 Junction/目录联接
+/// （如用户手工迁移目录），系统拒绝跨联接访问——给出可操作提示而不是裸 OS 码
+fn vault_key_io_err(op: &str, path: &Path, e: std::io::Error) -> String {
+    if e.raw_os_error() == Some(448) {
+        return format!(
+            "{op} vault 密钥失败（os error 448：不受信任的挂载点）——{} 可能位于 Junction/目录联接之下，Windows 拒绝跨联接访问。请将 conf 目录恢复为真实目录（删除联接、把内容移回原位）后重启应用",
+            path.display()
+        );
+    }
+    format!("{op} vault 密钥失败: {e}")
+}
+
+/// 同一错误消息只落一次日志（issue #153 修复 3）：vault 故障期 ns_get 会被
+/// 每账号每次 ensure_fresh 高频触发，相同失败原因会把 app_log 刷爆——进程内
+/// 按消息去重，仅首条落盘；不同消息（不同 key/不同故障）各自首条仍落
+fn log_once(data_dir: &Path, msg: &str) {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    if seen
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(msg.to_string())
+    {
+        crate::fs_utils::app_log(data_dir, msg);
+    }
+}
+
+/// 打开（并缓存）vault：首次调用时加载快照或创建新 client。
+/// 对齐 tauri-plugin-stronghold 2.3.2 的包装方式（iota_stronghold 2.1 engine API：
+/// Stronghold::default() + load_snapshot / commit_with_keyprovider）。
+/// 返回全局缓存的 guard；调用方经 locate() 取本 conf_path 的句柄（借用自 guard，
+/// 全局锁在借用期间天然持有）。调用方 conf_path 的桶若不存在则在此创建。
+fn open(
+    state: &AppState,
+) -> Result<std::sync::MutexGuard<'static, Vec<(std::path::PathBuf, VaultHandle)>>, String> {
+    // 锁中毒恢复：另一线程在持锁期间 panic 毒化锁时，直接恢复内部数据继续使用，
+    // 而不是让「vault 锁已被毒化」错误在所有后续调用上永久传播
+    let mut guard = VAULTS.lock().unwrap_or_else(|e| e.into_inner());
+    let path = state.conf_path("vault.stronghold");
+    if !guard.iter().any(|(p, _)| p == &path) {
+        let password = vault_password(state)?;
+        let snapshot = SnapshotPath::from_path(&path);
+        // KeyProvider 要求主密码恰好 32 字节（NC_DATA_SIZE），vault_password 已保证归一
+        let keyprovider = KeyProvider::try_from(Zeroizing::new(password))
+            .map_err(|e| format!("vault 密钥初始化失败: {e}"))?;
+        let sh = Stronghold::default();
+        // 快照存在性必须在加载前判定（port main aa4ec5a issue #139：供 client
+        // 加载失败时的错配防护判定；首次启动无快照，直接新建 client）
+        let snapshot_exists = path.exists();
+        if snapshot_exists {
+            sh.load_snapshot(&keyprovider, &snapshot)
+                .map_err(|e| format!("打开 vault 快照失败: {e}"))?;
+        }
+        // 快照数据不会自动进入 clients map，必须显式 load_client（见单元测试 stronghold_快照往返）；
+        // 仅当快照中不存在该 client（首次创建）时才新建，防止空 client 覆盖已有快照导致凭据丢失。
+        // 密钥/快照错配防护（port main aa4ec5a issue #139）：快照存在但 load_client
+        // 失败，大概率是 vault_key.bin（或 AIWORK_VAULT_KEY）与快照不匹配（如迁移
+        // 期间替换过密钥）——拒绝打开，禁止空 client 经 save() 覆盖原快照
+        if sh.load_client(CLIENT_PATH.to_vec()).is_err() {
+            if snapshot_exists {
+                return Err(format!(
+                    "vault 快照已存在但 client 加载失败（{}）：大概率 vault_key.bin 与快照不匹配（如迁移期间替换过密钥）。已拒绝打开，防止空 client 覆盖快照；请恢复匹配的密钥或快照备份",
+                    path.display()
+                ));
+            }
+            sh.create_client(CLIENT_PATH.to_vec())
+                .map_err(|e| format!("创建 vault client 失败: {e}"))?;
+        }
+        guard.push((path, VaultHandle { sh, snapshot, keyprovider }));
+    }
+    Ok(guard)
+}
+
+/// 从 open() 返回的 guard 中取指定 conf_path 的句柄（open 已确保桶存在；
+/// 找不到即程序不变量被破坏，调用方按 unreachable 处理并携带诊断信息）
+fn locate<'a>(
+    guard: &'a mut std::sync::MutexGuard<'static, Vec<(std::path::PathBuf, VaultHandle)>>,
+    path: &Path,
+) -> &'a mut VaultHandle {
+    guard
+        .iter_mut()
+        .find(|(p, _)| p == path)
+        .map(|(_, h)| h)
+        .unwrap_or_else(|| panic!("vault 句柄桶缺失（open 未创建该 conf_path）: {}", path.display()))
+}
+
+/// 测试专用：重置全局 vault 句柄（清空全部分桶）。分桶后跨目录测试天然隔离
+/// （各桶独立 stronghold 实例），本函数仅在「同目录复测需从磁盘快照重建」时
+/// 调用（ns_get/ns_set 每次均经 open() 惰性重建 + 快照 commit，重置安全且自愈）
+#[cfg(test)]
+pub(crate) fn reset_for_tests() {
+    VAULTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// 测试专用：触碰 vault 的测试统一入口——进程级串行互斥 + 持锁后重置。
+/// 分桶改造后跨目录测试天然隔离（各 conf_path 独立 stronghold 实例），本 guard
+/// 主要兜底「同目录被并行测试同时触碰」与既有测试语义依赖（重置后从磁盘重建）。
+/// Guard 须绑定具名变量持有至测试结束（`let _guard = vault_test_guard();`），
+/// 勿用 `let _ =` 立即释放。
+#[cfg(test)]
+pub(crate) fn vault_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    reset_for_tests();
+    guard
+}
+
+// ---------------- 公共 API ----------------
+
+/// 从磁盘加载账号文件，并从 vault 回填占位账号的明文凭据（仅内存，不落明文盘）。
+/// JSON 中已有的明文凭据优先（更新鲜，例如 MITM 新捕获，待下次保存迁移进 vault）。
+pub fn load_accounts(state: &AppState) -> AccountsFile {
+    // SQLite 化（P3）：checkin_accounts.json → accounts 表（行保序、user_id 可空）
+    let mut file: AccountsFile = crate::store::docs::accounts_load(&crate::store::db(&state.data_dir));
+    let mut guard = match open(state) {
+        Ok(g) => g,
+        Err(_) => return file, // vault 不可用：降级返回 JSON 原样（占位 jwt 视为空，上层自行报错）
+    };
+    let handle = locate(&mut guard, &state.conf_path("vault.stronghold"));
+    let Ok(client) = handle.sh.get_client(CLIENT_PATH.to_vec()) else {
+        return file;
+    };
+    for a in file.accounts.iter_mut() {
+        let Some(uid) = a.user_id.as_deref().filter(|u| !u.is_empty()) else {
+            continue;
+        };
+        if let Ok(Some(v)) = client.store().get(uid.as_bytes()) {
+            if let Ok(entry) = serde_json::from_slice::<SecretEntry>(&v) {
+                // JWT：JSON 明文优先（更新鲜，如 MITM 新捕获），无明文才回填 vault
+                if a.jwt.trim().is_empty() && !entry.jwt.trim().is_empty() {
+                    a.jwt = entry.jwt;
+                }
+                // RT：与 JWT 独立判断——JSON 无明文即回填 vault。
+                // 不能因 JWT 有捕获明文就跳过整个账号，否则代理捕获写回明文 JWT
+                // 后，OAuth 登录拿到的 vault RT 永远回填不上，账号会恒显「无 Refresh」。
+                // 审查修复：判定统一 trim（与上面 jwt 臂口径一致）——空白串（上游脏
+                // 数据常见）会被当作「已有 RT」而跳过回填
+                if a.refresh_token.as_deref().map_or(true, |s| s.trim().is_empty())
+                    && !entry.refresh_token.trim().is_empty()
+                {
+                    a.refresh_token = Some(entry.refresh_token);
+                }
+            }
+        }
+    }
+    file
+}
+
+/// 保存账号文件：非空凭据写入 vault（字段级合并）并落盘快照，JSON 占位化。
+/// vault 写失败时**禁止明文落盘**（审查 P1）且**数据库保持原状**（issue #153 修复 1）：
+/// 原实现「wipe 占位 + 落库」会在 vault 故障（如 os error 448）时当场销毁库中既有的
+/// 明文凭据（启动迁移场景）且无处恢复；现改为不落库直接返回 Err——迁移场景明文
+/// 保留在库中待 vault 修复后下次启动重试收敛，常规场景本次凭据更新仅存内存。
+/// 注意：仅成功路径会就地清空调用方结构体中的 jwt / refresh_token 字段。
+pub fn save_accounts(state: &AppState, accounts: &mut AccountsFile) -> Result<(), String> {
+    match write_vault_secrets(state, accounts) {
+        Ok(()) => {
+            // vault 已持久化 → 落库占位（明文唯一驻留地是 vault）
+            wipe_placeholders(accounts);
+            crate::store::docs::accounts_save(&crate::store::db(&state.data_dir), accounts)?;
+            Ok(())
+        }
+        Err(reason) => {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("vault 写入失败，数据库未改动（凭据未持久化，禁止明文落库）: {reason}"),
+            );
+            Err(format!(
+                "加密存储失败，数据库未改动，凭据未持久化（vault 错误: {reason}）"
+            ))
+        }
+    }
+}
+
+/// 将账号结构体中的明文凭据占位化（清空 jwt / refresh_token）
+fn wipe_placeholders(accounts: &mut AccountsFile) {
+    for a in accounts.accounts.iter_mut() {
+        if a.user_id.as_deref().map_or(false, |u| !u.is_empty()) {
+            a.jwt.clear();
+            a.refresh_token = None;
+        }
+    }
+}
+
+/// 把非空凭据写入 vault：读旧值做字段级合并（防止空字段覆盖 vault 中的有效值），最后快照落盘
+fn write_vault_secrets(state: &AppState, accounts: &AccountsFile) -> Result<(), String> {
+    let mut guard = open(state)?;
+    let handle = locate(&mut guard, &state.conf_path("vault.stronghold"));
+    let client = handle
+        .sh
+        .get_client(CLIENT_PATH.to_vec())
+        .map_err(|e| format!("获取 vault client 失败: {e}"))?;
+    let mut count = 0usize;
+    for a in &accounts.accounts {
+        let Some(uid) = a.user_id.as_deref().filter(|u| !u.is_empty()) else {
+            continue;
+        };
+        let jwt_new = a.jwt.trim();
+        let rt_new = a.refresh_token.as_deref().unwrap_or("").trim();
+        if jwt_new.is_empty() && rt_new.is_empty() {
+            continue; // 占位账号无凭据可写
+        }
+        let entry = merge_entry(
+            client
+                .store()
+                .get(uid.as_bytes())
+                .ok()
+                .flatten()
+                .and_then(|v| serde_json::from_slice::<SecretEntry>(&v).ok()),
+            jwt_new,
+            rt_new,
+        );
+        let value = serde_json::to_vec(&entry).map_err(|e| format!("凭据序列化失败: {e}"))?;
+        client
+            .store()
+            .insert(uid.as_bytes().to_vec(), value, None)
+            .map_err(|e| format!("vault 写入失败: {e}"))?;
+        count += 1;
+    }
+    handle
+        .sh
+        .commit_with_keyprovider(&handle.snapshot, &handle.keyprovider)
+        .map_err(|e| format!("vault 快照落盘失败: {e}"))?;
+    if count > 0 {
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!("vault: 已加密写入 {count} 个账号凭据"),
+        );
+    }
+    Ok(())
+}
+
+/// 字段级合并：新值非空才覆盖（纯函数，便于单测）
+fn merge_entry(existing: Option<SecretEntry>, jwt_new: &str, rt_new: &str) -> SecretEntry {
+    let mut entry = existing.unwrap_or_default();
+    if !jwt_new.is_empty() {
+        entry.jwt = jwt_new.to_string();
+    }
+    if !rt_new.is_empty() {
+        entry.refresh_token = rt_new.to_string();
+    }
+    entry
+}
+
+/// 删除账号时同步清理 vault 记录（失败仅记录，不阻断账号删除）
+pub fn remove_secret(state: &AppState, uid: &str) {
+    let result = (|| -> Result<(), String> {
+        let mut guard = open(state)?;
+        let handle = locate(&mut guard, &state.conf_path("vault.stronghold"));
+        let client = handle
+            .sh
+            .get_client(CLIENT_PATH.to_vec())
+            .map_err(|e| format!("获取 vault client 失败: {e}"))?;
+        client
+            .store()
+            .delete(uid.as_bytes())
+            .map_err(|e| format!("vault 删除失败: {e}"))?;
+        handle
+            .sh
+            .commit_with_keyprovider(&handle.snapshot, &handle.keyprovider)
+            .map_err(|e| format!("vault 快照落盘失败: {e}"))
+    })();
+    match result {
+        Ok(()) => fs_utils::app_log(&state.data_dir, &format!("vault: 已删除账号 {uid} 的凭据记录")),
+        Err(e) => fs_utils::app_log(
+            &state.data_dir,
+            &format!("vault: 删除账号 {uid} 凭据失败（残留记录无碍安全）: {e}"),
+        ),
+    }
+}
+
+// ---------------- 命名空间凭证（qoder 等多平台复用同一快照）----------------
+
+/// vault 键前缀：`ns:<namespace>:<key>`（冒号分隔，namespace/key 均不允许含冒号）
+fn ns_vault_key(ns: &str, key: &str) -> Vec<u8> {
+    format!("ns:{ns}:{key}").into_bytes()
+}
+
+/// 审查 #15：ns/key 合法性校验（ns_vault_key 以冒号分隔——含冒号的 ns/key
+/// 会与其他组合拼出同一歧义键，造成跨命名空间读写串）。Some(原因) = 非法。
+fn ns_key_invalid(ns: &str, key: &str) -> Option<&'static str> {
+    if ns.is_empty() || key.is_empty() {
+        Some("命名空间或键为空")
+    } else if ns.contains(':') || key.contains(':') {
+        Some("命名空间/键不允许包含冒号")
+    } else {
+        None
+    }
+}
+
+/// 探测 vault 当前是否可用（issue #153 修复 2）：不读写任何记录，仅验证
+/// 打开（含快照加载与 client 校验）成功。用于调用方区分「vault 系统性故障」
+/// 与「确实无凭证」——ns_get 对两者都返回 None（fail-secure），凭证消费方
+///（如 ensure_fresh）借此把故障期误判为 no_credential 的情况识别出来，
+/// 避免触发永久禁用等不可自愈的下游处置。
+pub fn available(data_dir: &Path) -> bool {
+    let state = AppState::with_data_dir(data_dir.to_path_buf());
+    (|| -> Result<(), String> {
+        let mut guard = open(&state)?;
+        let handle = locate(&mut guard, &state.conf_path("vault.stronghold"));
+        handle
+            .sh
+            .get_client(CLIENT_PATH.to_vec())
+            .map(|_| ())
+            .map_err(|e| format!("获取 vault client 失败: {e}"))
+    })()
+    .is_ok()
+}
+
+/// 读取命名空间凭证（不存在返回 None；失败仅日志并返回 None）
+pub fn ns_get(data_dir: &Path, ns: &str, key: &str) -> Option<serde_json::Value> {
+    if ns_key_invalid(ns, key).is_some() {
+        return None;
+    }
+    let state = AppState::with_data_dir(data_dir.to_path_buf());
+    let result = (|| -> Result<Option<serde_json::Value>, String> {
+        let mut guard = open(&state)?;
+        let handle = locate(&mut guard, &state.conf_path("vault.stronghold"));
+        let client = handle
+            .sh
+            .get_client(CLIENT_PATH.to_vec())
+            .map_err(|e| format!("获取 vault client 失败: {e}"))?;
+        match client
+            .store()
+            .get(&ns_vault_key(ns, key))
+            .map_err(|e| format!("vault 读取失败: {e}"))?
+        {
+            Some(v) => serde_json::from_slice(&v)
+                .map(Some)
+                .map_err(|e| format!("凭证解析失败: {e}")),
+            None => Ok(None),
+        }
+    })();
+    result
+    .inspect_err(|e| {
+        log_once(data_dir, &format!("[vault] ns_get {ns}:{key} 失败: {e}"));
+    })
+    .ok()
+    .flatten()
+}
+
+/// 写入命名空间凭证 + 快照落盘。失败返回 Err（调用方对齐 Trae 红线：
+/// 禁止在 vault 写失败时把明文落库，应只落占位并报错）。
+pub fn ns_set(data_dir: &Path, ns: &str, key: &str, v: &serde_json::Value) -> Result<(), String> {
+    if let Some(reason) = ns_key_invalid(ns, key) {
+        return Err(format!("命名空间凭证非法: {reason}"));
+    }
+    let state = AppState::with_data_dir(data_dir.to_path_buf());
+    let mut guard = open(&state)?;
+    let handle = locate(&mut guard, &state.conf_path("vault.stronghold"));
+    let client = handle
+        .sh
+        .get_client(CLIENT_PATH.to_vec())
+        .map_err(|e| format!("获取 vault client 失败: {e}"))?;
+    let value = serde_json::to_vec(v).map_err(|e| format!("凭证序列化失败: {e}"))?;
+    client
+        .store()
+        .insert(ns_vault_key(ns, key), value, None)
+        .map_err(|e| format!("vault 写入失败: {e}"))?;
+    handle
+        .sh
+        .commit_with_keyprovider(&handle.snapshot, &handle.keyprovider)
+        .map_err(|e| format!("vault 快照落盘失败: {e}"))
+}
+
+/// 删除命名空间凭证（失败仅日志，不阻断上层删除流程——残留加密记录无碍安全）
+pub fn ns_remove(data_dir: &Path, ns: &str, key: &str) {
+    if let Some(reason) = ns_key_invalid(ns, key) {
+        fs_utils::app_log(data_dir, &format!("vault: 删除 {ns}:{key} 凭证跳过: {reason}"));
+        return;
+    }
+    let state = AppState::with_data_dir(data_dir.to_path_buf());
+    let result = (|| -> Result<(), String> {
+        let mut guard = open(&state)?;
+        let handle = locate(&mut guard, &state.conf_path("vault.stronghold"));
+        let client = handle
+            .sh
+            .get_client(CLIENT_PATH.to_vec())
+            .map_err(|e| format!("获取 vault client 失败: {e}"))?;
+        client
+            .store()
+            .delete(&ns_vault_key(ns, key))
+            .map_err(|e| format!("vault 删除失败: {e}"))?;
+        handle
+            .sh
+            .commit_with_keyprovider(&handle.snapshot, &handle.keyprovider)
+            .map_err(|e| format!("vault 快照落盘失败: {e}"))
+    })();
+    if let Err(e) = result {
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!("vault: 删除 {ns}:{key} 凭证失败（残留加密记录无碍安全）: {e}"),
+        );
+    }
+}
+
+/// 启动时幂等迁移：库中明文 jwt / refresh_token → vault，随后占位化。
+/// （SQLite 化 P4：原读 checkin_accounts.json，现读 accounts 表——main.rs 已调整为
+/// store 迁移先于本函数，JSON 导入的明文凭据在此收敛进 vault 并从库中抹除。）
+/// 失败不阻断启动（下次启动重试；vault 异常时 save_accounts 仅落盘占位信息，禁止明文）。
+pub fn migrate_on_startup(state: &AppState) {
+    // WB 工具侧凭证收敛（P0-1 补遗，审查 #9）：wb_tokens 表中 1.3.6 及更早版本
+    // 遗留的明文敏感字段 → vault，随后占位化。幂等：已占位行无明文，自然跳过。
+    // 两段式写序（先 vault 成功、后 DB 占位）确保 vault 失败时明文保留、下次启动重试。
+    // （qoder_tokens 无存量部署——Qoder 平台自 1.3.7 新增，写入路径天然收敛，无需迁移。）
+    let wb_raw = crate::store::docs::wb_token_store_load(&crate::store::db(&state.data_dir));
+    if let Some(tokens) = wb_raw.get("tokens").and_then(serde_json::Value::as_object) {
+        let mut migrated = 0usize;
+        for (id, rec) in tokens {
+            let mut acc = "";
+            let mut rt = "";
+            for k in crate::tasks::wb_common::TOKEN_SENSITIVE_KEYS {
+                if let Some(s) = rec.get(k).and_then(serde_json::Value::as_str) {
+                    if s.is_empty() {
+                        continue;
+                    }
+                    if k.ends_with("ccess_token") {
+                        acc = s;
+                    } else {
+                        rt = s;
+                    }
+                }
+            }
+            if acc.is_empty() && rt.is_empty() {
+                continue;
+            }
+            let mut entry =
+                ns_get(&state.data_dir, "wb", id).unwrap_or_else(|| serde_json::json!({}));
+            if !entry.is_object() {
+                entry = serde_json::json!({});
+            }
+            if let Some(em) = entry.as_object_mut() {
+                if !acc.is_empty() {
+                    em.insert("access_token".into(), serde_json::json!(acc));
+                }
+                if !rt.is_empty() {
+                    em.insert("refresh_token".into(), serde_json::json!(rt));
+                }
+            }
+            if ns_set(&state.data_dir, "wb", id, &entry).is_err() {
+                fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("启动迁移: WB 凭证 {id} 写入 vault 失败（明文保留，下次启动重试）"),
+                );
+                continue;
+            }
+            // vault 已写入 → DB 占位化（仅敏感键置空串，其余字段原样保留）
+            let mut ph = rec.clone();
+            if let Some(rm) = ph.as_object_mut() {
+                for k in crate::tasks::wb_common::TOKEN_SENSITIVE_KEYS {
+                    if rm.contains_key(k) {
+                        rm.insert(k.to_string(), serde_json::json!(""));
+                    }
+                }
+            }
+            let _ = crate::store::docs::wb_token_store_upsert(
+                &crate::store::db(&state.data_dir),
+                id,
+                &ph,
+            );
+            migrated += 1;
+        }
+        if migrated > 0 {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("启动迁移: 已将 {migrated} 个 WB 账号的明文凭据加密写入 vault"),
+            );
+        }
+    }
+    // API Key 收敛（对齐上游 9ba5fd0「API Key vault 化」；docker 适配批次 E 内存权威架构）：
+    // api_keys 表中遗留明文 key → vault ns `api_key`（按条目 id），随后 DB 占位化。
+    // 幂等：占位行 key 为空自然跳过；两段式写序（先 vault 后占位）确保 vault 失败时
+    // 明文保留、下次启动重试。运行时 verify/展示走内存权威副本（api_keys::entry_or_load
+    // 读侧回填），增量落库收敛统一在 api_keys::persist，此处仅收存量。
+    {
+        let mut file = crate::store::docs::api_keys_load(&crate::store::db(&state.data_dir));
+        let mut migrated = 0usize;
+        for k in file.keys.iter_mut() {
+            if k.key.trim().is_empty() {
+                continue;
+            }
+            let entry = serde_json::json!({ "key": k.key });
+            if ns_set(&state.data_dir, "api_key", &k.id, &entry).is_ok() {
+                k.key = String::new();
+                migrated += 1;
+            } else {
+                // 诊断（CI 复盘）：app_log 只落 data_dir 文件，测试进程不可见——
+                // 迁移失败静默会让「库中应占位化」类断言无从归因，同步打 stderr
+                let msg = format!(
+                    "启动迁移: API Key {} 写入 vault 失败（明文保留，下次启动重试）",
+                    k.id
+                );
+                eprintln!("[vault] {msg}");
+                fs_utils::app_log(&state.data_dir, &msg);
+            }
+        }
+        if migrated > 0 {
+            if let Err(e) =
+                crate::store::docs::api_keys_save(&crate::store::db(&state.data_dir), &file)
+            {
+                // 占位化写回失败同样静默吞错会让断言/对账无从归因，同步 stderr
+                eprintln!("[vault] 启动迁移: API Key 占位化写回失败: {e}");
+            }
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("启动迁移: 已将 {migrated} 个 API Key 加密写入 vault（库中占位化）"),
+            );
+        }
+    }
+    let raw: AccountsFile = crate::store::docs::accounts_load(&crate::store::db(&state.data_dir));
+    let plaintext = raw
+        .accounts
+        .iter()
+        .filter(|a| {
+            !a.jwt.trim().is_empty() || a.refresh_token.as_deref().map_or(false, |s| !s.is_empty())
+        })
+        .count();
+    if plaintext == 0 {
+        return; // 无明文凭据，幂等退出
+    }
+    let mut accounts = load_accounts(state);
+    match save_accounts(state, &mut accounts) {
+        Ok(()) => fs_utils::app_log(
+            &state.data_dir,
+            &format!("启动迁移: 已将 {plaintext} 个账号的明文凭据加密写入 vault"),
+        ),
+        Err(e) => fs_utils::app_log(
+            &state.data_dir,
+            &format!("启动迁移: 写入 vault 失败（数据库未改动，明文保留待下次启动重试）: {e}"),
+        ),
+    }
+}
+
+/// 清理目录下残留的临时凭据文件（按前缀匹配，覆盖 write_json 的 .tmp 半成品），返回数量
+fn cleanup_temp_in(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut n = 0usize;
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        if entry.file_name().to_string_lossy().starts_with(TEMP_ACCOUNTS_PREFIX) {
+            if std::fs::remove_file(entry.path()).is_ok() {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// 启动时清理残留的临时凭据文件（进程崩溃/被杀时未及删除的明文文件）
+pub fn cleanup_temp_accounts(state: &AppState) {
+    let n = cleanup_temp_in(&state.data_dir);
+    if n > 0 {
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!("vault: 已清理 {n} 个残留临时凭据文件"),
+        );
+    }
+}
+
+// ---------------- 单元测试 ----------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::RawAccount;
+
+    #[test]
+    fn merge_entry_覆盖非空字段并保留旧值() {
+        let old = SecretEntry {
+            jwt: "old-jwt".into(),
+            refresh_token: "old-rt".into(),
+        };
+        // 新 jwt 非空、rt 为空 → 只覆盖 jwt
+        let merged = merge_entry(Some(old.clone()), "new-jwt", "");
+        assert_eq!(merged.jwt, "new-jwt");
+        assert_eq!(merged.refresh_token, "old-rt");
+        // 全空 → 不变
+        let merged = merge_entry(Some(old), "", "");
+        assert_eq!(merged.jwt, "old-jwt");
+        assert_eq!(merged.refresh_token, "old-rt");
+        // 无旧值 → 取新值
+        let merged = merge_entry(None, "j", "r");
+        assert_eq!(
+            merged,
+            SecretEntry {
+                jwt: "j".into(),
+                refresh_token: "r".into()
+            }
+        );
+    }
+
+    #[test]
+    fn wipe_placeholders_仅清空凭据保留元数据() {
+        let mut file = AccountsFile {
+            accounts: vec![
+                RawAccount {
+                    name: "A".into(),
+                    user_id: Some("10001".into()),
+                    jwt: "secret-jwt".into(),
+                    refresh_token: Some("secret-rt".into()),
+                    added_at: Some("t".into()),
+                    updated_at: Some("t".into()),
+                    dc_id: None,
+                    refresh_token_expires_at: None,
+                    refresh_token_fails: 0,
+                    refresh_token_invalid: false,
+                    auth_saved_at: None,
+                },
+                // 无 uid 的账号不占位（vault 无法按 uid 键存储）
+                RawAccount {
+                    name: "B".into(),
+                    user_id: None,
+                    jwt: "keep-jwt".into(),
+                    refresh_token: None,
+                    added_at: None,
+                    updated_at: None,
+                    dc_id: None,
+                    refresh_token_expires_at: None,
+                    refresh_token_fails: 0,
+                    refresh_token_invalid: false,
+                    auth_saved_at: None,
+                },
+            ],
+        };
+        wipe_placeholders(&mut file);
+        assert_eq!(file.accounts[0].jwt, "");
+        assert_eq!(file.accounts[0].refresh_token, None);
+        assert_eq!(file.accounts[0].name, "A");
+        assert_eq!(file.accounts[0].user_id, Some("10001".into()));
+        assert_eq!(file.accounts[0].added_at, Some("t".into()));
+        // 无 uid 账号保持原样
+        assert_eq!(file.accounts[1].jwt, "keep-jwt");
+    }
+
+    #[test]
+    fn cleanup_temp_in_仅删前缀文件() {
+        let dir = std::env::temp_dir().join(format!("vault_cleanup_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("trae_checkin_accounts_1.json"), "{}").unwrap();
+        std::fs::write(dir.join("trae_checkin_accounts_2.tmp"), "{}").unwrap();
+        std::fs::write(dir.join("other.json"), "{}").unwrap();
+        std::fs::create_dir(dir.join("trae_checkin_accounts_dir")).unwrap();
+        let n = cleanup_temp_in(&dir);
+        assert_eq!(n, 2);
+        assert!(dir.join("other.json").exists());
+        assert!(dir.join("trae_checkin_accounts_dir").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn key_provider_v2文件往返与旧blob拒绝() {
+        // "V2:" + hex 文件 → 正确解码 32 字节
+        let key = [7u8; 32];
+        let content = format!("V2:{}", bytes_to_hex(&key));
+        let parsed = parse_key_file(content.as_bytes(), Path::new("vault_key.bin")).expect("parse");
+        assert_eq!(parsed, key.to_vec());
+
+        // 旧版 DPAPI blob（无 V2 前缀）→ 明确迁移错误
+        let err = parse_key_file(&[1, 2, 3, 4], Path::new("vault_key.bin")).unwrap_err();
+        assert!(err.contains("旧版桌面"));
+
+        // env 密钥归一化：任意字符串 → 确定性 32 字节
+        assert_eq!(normalize_key(b"my-vault-key"), normalize_key(b"my-vault-key"));
+        assert_eq!(normalize_key(b"my-vault-key").len(), 32);
+    }
+
+    #[test]
+    fn key_provider_v2长度或字符非法时报错() {
+        let path = Path::new("vault_key.bin");
+        // 长度不对（63 位 hex）
+        let short = format!("V2:{}a", "ab".repeat(31));
+        let err = parse_key_file(short.as_bytes(), path).unwrap_err();
+        assert!(err.contains("64 位 hex"), "实际报错: {err}");
+        // 非 hex 字符（ASCII）→ 被 hexdigit 全量校验拦下
+        let bad = format!("V2:{}", "z".repeat(64));
+        let err = parse_key_file(bad.as_bytes(), path).unwrap_err();
+        assert!(err.contains("非 hex 字符"), "实际报错: {err}");
+        // 多字节 UTF-8 且总字节长恰为 64（共享目录手工编辑污染场景）：
+        // é 从奇数字节偏移 61 开始，旧代码按字节切片会在 char boundary
+        // 中间 panic；须收敛为友好 Err（panic 回归用例，port main aa4ec5a）
+        let multibyte = format!("V2:{}éa", "a".repeat(61));
+        assert_eq!(multibyte.len(), 67); // 3 前缀 + 61 + 2 + 1 = 67 字节
+        let err = parse_key_file(multibyte.as_bytes(), path).unwrap_err();
+        assert!(err.contains("非 hex 字符"), "实际报错: {err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stronghold_快照往返() {
+        // 验证 engine API 用法：create_client → store 写入 → commit 快照 → 重载快照 → load_client 读取
+        let dir = std::env::temp_dir().join(format!("vault_rs_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("roundtrip.stronghold");
+        let snapshot = SnapshotPath::from_path(&path);
+        // KeyProvider 要求主密码恰好 32 字节（NC_DATA_SIZE），与生产 generate_password 输出一致
+        let keyprovider = KeyProvider::try_from(Zeroizing::new(vec![7u8; 32])).expect("keyprovider");
+        {
+            let sh = Stronghold::default();
+            if sh.get_client(CLIENT_PATH.to_vec()).is_err() {
+                sh.create_client(CLIENT_PATH.to_vec()).expect("create client");
+            }
+            let entry = SecretEntry {
+                jwt: "jwt-value".into(),
+                refresh_token: "rt-value".into(),
+            };
+            let value = serde_json::to_vec(&entry).unwrap();
+            let client = sh.get_client(CLIENT_PATH.to_vec()).unwrap();
+            client
+                .store()
+                .insert("10001".as_bytes().to_vec(), value, None)
+                .expect("insert");
+            sh.commit_with_keyprovider(&snapshot, &keyprovider).expect("commit");
+        }
+        {
+            let sh = Stronghold::default();
+            sh.load_snapshot(&keyprovider, &snapshot).expect("load snapshot");
+            // 快照数据不会自动进入 clients map，必须显式 load_client
+            sh.load_client(CLIENT_PATH.to_vec()).expect("load client");
+            let client = sh.get_client(CLIENT_PATH.to_vec()).unwrap();
+            let v = client.store().get("10001".as_bytes()).expect("get");
+            let entry: SecretEntry = serde_json::from_slice(&v.expect("record exists")).unwrap();
+            assert_eq!(entry.jwt, "jwt-value");
+            assert_eq!(entry.refresh_token, "rt-value");
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+}

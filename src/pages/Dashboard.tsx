@@ -1,0 +1,355 @@
+import { useMemo, useEffect, useState } from 'react';
+import {
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  ResponsiveContainer,
+  Tooltip,
+  CartesianGrid,
+  Cell,
+  LabelList,
+  Legend,
+} from 'recharts';
+import { RefreshCw, CheckCircle2, Circle, ChevronRight, Loader2 } from 'lucide-react';
+import PageHeader from '../components/PageHeader';
+import { StatCard, Badge } from '../components/ui';
+import { useAppStore } from '../store';
+import { api } from '../lib/tauri';
+import { useIsDark } from '../lib/useIsDark';
+import type { CheckinTrendPoint, ViewKey } from '../types';
+
+/** 配置导航步骤（对齐 Buddy/Qoder 概述 SetupGuide 形态；optional 步骤不计入完成度） */
+interface Step {
+  key: string;
+  title: string;
+  desc: string;
+  done: boolean;
+  actionLabel: string;
+  view: ViewKey;
+  /** 可选步骤：不计入 x/y 完成度 */
+  optional?: boolean;
+}
+
+export default function Dashboard() {
+  const accounts = useAppStore((s) => s.accounts);
+  const toast = useAppStore((s) => s.pushToast);
+  const setView = useAppStore((s) => s.setView);
+  const isDark = useIsDark();
+  // 近 30 天签到结果趋势（堆叠柱状图数据，T8）
+  const [trends, setTrends] = useState<CheckinTrendPoint[]>([]);
+
+  const loadTrends = async () => {
+    try {
+      setTrends(await api.checkin.trends(30));
+    } catch {
+      /* 查询失败保持空态展示 */
+    }
+  };
+  useEffect(() => {
+    void loadTrends();
+  }, []);
+
+  const total = accounts.length;
+  const checkedToday = accounts.filter((a) => a.checked_today).length;
+  const totalCredits = useMemo(
+    () => accounts.reduce((s, a) => s + (a.remaining_credits ?? 0), 0),
+    [accounts],
+  );
+  const generalCredits = useMemo(
+    () => accounts.reduce((s, a) => s + (a.general_credits ?? 0), 0),
+    [accounts],
+  );
+  const workCredits = useMemo(
+    () => accounts.reduce((s, a) => s + (a.work_credits ?? 0), 0),
+    [accounts],
+  );
+  const fmt = (v: number) => v.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
+  const creditsHint = accounts.some((a) => a.general_credits != null || a.work_credits != null)
+    ? `通用 ${fmt(generalCredits)} 积分 · Work ${fmt(workCredits)} 积分`
+    : '总剩余可用积分';
+
+  const top = useMemo(
+    () =>
+      [...accounts]
+        .filter((a) => a.remaining_credits != null && a.remaining_credits > 0)
+        .sort((a, b) => (b.remaining_credits ?? 0) - (a.remaining_credits ?? 0))
+        .slice(0, 10)
+        .map((a) => ({
+          name: a.name,
+          credits: a.remaining_credits as number,
+          general: a.general_credits,
+          work: a.work_credits,
+        })),
+    [accounts],
+  );
+
+  // Top 榜悬浮提示：展示通用/Work 积分明细（账号名作标题）
+  const TopTooltip = ({
+    active,
+    payload,
+  }: {
+    active?: boolean;
+    payload?: { payload: (typeof top)[number] }[];
+  }) => {
+    if (!active || !payload?.length) return null;
+    const p = payload[0].payload;
+    const fmt = (v: number) => v.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
+    return (
+      <div
+        style={{
+          fontSize: 12,
+          borderRadius: 10,
+          border: `1px solid ${isDark ? '#3f3f46' : '#e2e8f0'}`,
+          background: isDark ? '#18181b' : '#fff',
+          color: isDark ? '#e4e4e7' : '#1e293b',
+          boxShadow: '0 6px 16px rgba(0,0,0,0.1)',
+          padding: '8px 12px',
+        }}
+      >
+        <div className="font-medium">{p.name}</div>
+        <div>通用积分：{fmt(p.general ?? 0)}</div>
+        <div>Work积分：{fmt(p.work ?? 0)}</div>
+      </div>
+    );
+  };
+
+  // 刷新防重入（审查 F3.2）：连点重复整套刷新 + 逐账号上游积分查询；
+  // 成功提示移到积分查询完成后，语义更准（此前积分还在后台跑就弹「已刷新」）
+  const [refreshing, setRefreshing] = useState(false);
+  const refresh = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    toast('info', '刷新中…');
+    try {
+      const s = useAppStore.getState();
+      await Promise.all([
+        s.refreshAccounts(),
+        s.refreshGroups(),
+        s.refreshCreditsDaily(),
+        loadTrends(),
+      ]);
+      // 刷新剩余可用积分（会再次 refreshAccounts 更新 UI）
+      await api.accounts
+        .refreshRemainingCredits()
+        .then(() => s.refreshAccounts())
+        .catch(() => {});
+      toast('success', '已刷新');
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  // 告警提醒：JWT 24h 内将过期 + 积分 7 日内将过期（含已过期）的账号数
+  const warned = accounts.filter(
+    (a) => a.jwt_exp_hours !== null && a.jwt_exp_hours <= 24,
+  ).length;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const creditWarned = accounts.filter(
+    (a) => a.credits_expire_at != null && a.credits_expire_at <= nowSec + 7 * 86400,
+  ).length;
+  const alertCount = warned + creditWarned;
+
+  // 配置导航（步骤完成态实时判定，对齐 Buddy/Qoder 概述）
+  const steps: Step[] = [
+    {
+      key: 'account',
+      title: '录入账号',
+      desc: '通过 OAuth 登录或导入账号的方式将账号入池。',
+      done: accounts.length > 0,
+      actionLabel: '去录入',
+      view: 'accounts',
+    },
+    {
+      key: 'checkin',
+      title: '完成首次签到',
+      desc: '验证签到链路是否跑通（凭证有效、接口可达）。',
+      done: accounts.some((a) => a.checked_today),
+      actionLabel: '去签到',
+      view: 'checkin',
+    },
+    {
+      key: 'credits',
+      title: '查询积分余额',
+      desc: '录入凭证后查询各账号积分余额与到期情况。',
+      done: accounts.some((a) => a.remaining_credits != null),
+      actionLabel: '查看积分',
+      view: 'credits',
+    },
+  ];
+  // 可选步骤不计入完成度
+  const required = steps.filter((s) => !s.optional);
+  const completed = required.filter((s) => s.done).length;
+  const allDone = completed === required.length;
+
+  return (
+    <div className="animate-fade-in">
+      <PageHeader
+        title="Trae · 概览"
+        desc="多账号签到与账号管理总览 · 告警提醒 · 签到趋势与积分榜"
+        actions={
+          <button onClick={() => void refresh()} disabled={refreshing} className="btn-outline">
+            {refreshing ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />} 刷新
+          </button>
+        }
+      />
+
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-3">
+        <StatCard label="账号总数" value={total} hint={`今日已签 ${checkedToday}`} tone="brand" />
+        <StatCard label="可用总积分" value={totalCredits.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })} hint={creditsHint} tone="amber" />
+        <StatCard
+          label="告警提醒"
+          value={alertCount}
+          hint={`JWT 24h 内过期 ${warned} · 积分 7 日内过期 ${creditWarned}`}
+          tone={alertCount > 0 ? 'red' : 'slate'}
+        />
+      </div>
+
+      {/* 近 30 天签到结果趋势（无数据显示空态，T8） */}
+      <div className="mt-5 card p-5">
+        <div className="mb-4 flex items-center justify-between">
+          <h3 className="font-medium">近 30 天签到结果</h3>
+          <span className="text-xs text-slate-400">按日汇总 · 成功 / 已签 / 失败</span>
+        </div>
+        {trends.length === 0 ? (
+          <div className="flex h-40 items-center justify-center text-sm text-slate-400">
+            暂无签到记录，完成一次签到后这里会显示趋势。
+          </div>
+        ) : (
+          <div className="h-64">
+            <ResponsiveContainer>
+              <BarChart data={trends} margin={{ top: 8, right: 16, left: 0, bottom: 4 }} barCategoryGap="24%">
+                <CartesianGrid strokeDasharray="3 3" stroke={isDark ? '#3f3f46' : '#e2e8f0'} opacity={0.25} vertical={false} />
+                <XAxis
+                  dataKey="date"
+                  tickFormatter={(v: string) => v.slice(5)}
+                  tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }}
+                  axisLine={{ stroke: isDark ? '#3f3f46' : '#e2e8f0' }}
+                  tickLine={false}
+                />
+                <YAxis allowDecimals={false} tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }} axisLine={false} tickLine={false} width={36} />
+                <Tooltip
+                  cursor={{ fill: isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.03)' }}
+                  contentStyle={{
+                    fontSize: 12,
+                    borderRadius: 10,
+                    border: `1px solid ${isDark ? '#3f3f46' : '#e2e8f0'}`,
+                    background: isDark ? '#18181b' : '#fff',
+                    color: isDark ? '#e4e4e7' : '#1e293b',
+                    boxShadow: '0 6px 16px rgba(0,0,0,0.1)',
+                    padding: '8px 12px',
+                  }}
+                />
+                <Legend wrapperStyle={{ fontSize: 12 }} />
+                <Bar dataKey="ok" name="成功" stackId="trend" fill="#10b981" maxBarSize={28} />
+                <Bar dataKey="already" name="已签" stackId="trend" fill="#0ea5e9" maxBarSize={28} />
+                <Bar dataKey="failed" name="失败" stackId="trend" fill="#f43f5e" maxBarSize={28} radius={[4, 4, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+      </div>
+
+      {top.length > 0 && (
+        <div className="mt-5 card p-5">
+          <div className="mb-4 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <h3 className="font-medium">积分榜 Top 榜</h3>
+              <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-xs font-medium text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
+                Top {top.length}
+              </span>
+            </div>
+            <span className="text-xs text-slate-400">按可用积分排序</span>
+          </div>
+          <div className="h-72">
+            <ResponsiveContainer>
+              <BarChart data={top} margin={{ top: 24, right: 16, left: 0, bottom: 4 }} barCategoryGap="36%">
+                <CartesianGrid strokeDasharray="3 3" stroke={isDark ? '#3f3f46' : '#e2e8f0'} opacity={0.25} vertical={false} />
+                <XAxis
+                  dataKey="name"
+                  tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }}
+                  interval={0}
+                  angle={-20}
+                  textAnchor="end"
+                  height={52}
+                  axisLine={{ stroke: isDark ? '#3f3f46' : '#e2e8f0' }}
+                  tickLine={false}
+                />
+                <YAxis tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }} axisLine={false} tickLine={false} width={48} />
+                <Tooltip
+                  cursor={{ fill: isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.03)' }}
+                  content={<TopTooltip />}
+                />
+                <Bar dataKey="credits" radius={[8, 8, 0, 0]} maxBarSize={44}>
+                  {top.map((_, i) => {
+                    // Top 1-3 使用强调色，其余渐淡；暗色模式下反转明度
+                    const colors = isDark
+                      ? ['#fafafa', '#e4e4e7', '#d4d4d8']
+                      : ['#27272a', '#3f3f46', '#52525b'];
+                    const fill = i < 3 ? colors[i] : isDark
+                      ? `rgba(212,212,216,${Math.max(0.35, 0.6 - (i - 3) * 0.05).toFixed(2)})`
+                      : `rgba(82,82,91,${Math.max(0.35, 0.6 - (i - 3) * 0.05).toFixed(2)})`;
+                    return <Cell key={i} fill={fill} />;
+                  })}
+                  <LabelList
+                    dataKey="credits"
+                    position="top"
+                    formatter={(v: number) => v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v.toFixed(0)}
+                    style={{ fontSize: 10, fill: isDark ? '#a1a1aa' : '#94a3b8', fontWeight: 500 }}
+                  />
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      )}
+
+      {/* 配置导航（对齐 Buddy/Qoder 概述 SetupGuide 形态） */}
+      <div className="mt-5 card overflow-hidden">
+        <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3 dark:border-zinc-800">
+          <div>
+            <h3 className="font-medium">配置导航</h3>
+            <p className="text-xs text-slate-500">按步骤完成初始化，已完成的步骤无需重复处理。</p>
+          </div>
+          <Badge tone={allDone ? 'green' : 'amber'}>
+            {completed}/{required.length} 已完成
+          </Badge>
+        </div>
+        <ol className="divide-y divide-slate-100 dark:divide-slate-800">
+          {steps.map((step, i) => (
+            <li key={step.key} className="flex items-center gap-3 px-4 py-3">
+              <div className={step.done ? 'text-emerald-500' : 'text-slate-300 dark:text-zinc-600'}>
+                {step.done ? <CheckCircle2 size={20} /> : <Circle size={20} />}
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-medium text-slate-800 dark:text-zinc-100">
+                  {i + 1}. {step.title}
+                </div>
+                <div className="text-xs text-slate-500">{step.desc}</div>
+              </div>
+              {step.done ? (
+                <span className="shrink-0 rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-600 dark:bg-emerald-500/15 dark:text-emerald-400">
+                  已完成
+                </span>
+              ) : step.optional ? (
+                <span className="shrink-0 rounded-full bg-zinc-100 px-2.5 py-1 text-xs font-medium text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
+                  可选
+                </span>
+              ) : (
+                <button onClick={() => setView(step.view)} className="btn-outline shrink-0">
+                  {step.actionLabel}
+                  <ChevronRight size={14} />
+                </button>
+              )}
+            </li>
+          ))}
+        </ol>
+        {allDone && (
+          <div className="border-t border-slate-100 bg-emerald-50/60 px-4 py-3 text-sm text-emerald-700 dark:border-zinc-800 dark:bg-emerald-500/10 dark:text-emerald-300">
+            🎉 全部配置已完成，定时签到与积分轮换交给自动化即可！
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
