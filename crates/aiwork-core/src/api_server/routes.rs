@@ -1196,13 +1196,34 @@ pub async fn models(
                 Some((buddy_ai_enabled, buddy_ai_ok)),
                 qoder_flash_free,
             );
+            // 按 key 绑定池 → 只显示该池的【官方目录】模型：
+            //   buddy  → wb_catalog::load() 的 15 个官方 ID
+            //   trae   → models_sync::load_models() 的 Trae 官方 ID
+            //   其余池（buddy-ai/qoder/custom）→ 按 sources 池归属过滤
+            let official_ids: Option<std::collections::HashSet<String>> = match bind.as_str() {
+                "buddy" => Some(
+                    super::wb_catalog::load(&data_dir)
+                        .into_iter()
+                        .map(|m| m.id.to_lowercase())
+                        .collect(),
+                ),
+                "trae" => Some(
+                    super::models_sync::load_models(&data_dir)
+                        .into_iter()
+                        .map(|m| m.id.to_lowercase())
+                        .collect(),
+                ),
+                _ => None,
+            };
             all.into_iter()
                 .filter(|m| {
-                    m.sources.iter().any(|s| {
-                        !s.disabled
-                            && (s.pool == *bind
-                                || (bind == "buddy" && s.pool == "buddy-ai"))
-                    })
+                    if let Some(ref ids) = official_ids {
+                        ids.contains(&m.id.to_lowercase())
+                    } else {
+                        m.sources.iter().any(|s| {
+                            !s.disabled && (s.pool == *bind)
+                        })
+                    }
                 })
                 .collect()
         } else {
