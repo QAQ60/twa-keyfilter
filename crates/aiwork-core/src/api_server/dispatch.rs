@@ -515,6 +515,9 @@ pub fn resolve_target(
         Some((pool, bare)) => (Some(pool), bare),
         None => (None, model),
     };
+    // 展示层倍率后缀（/v1/models 拼 `·x0.69` 供 Minis 显示）在调用入口剥回裸名，
+    // 否则带后缀 id 会被当作未知模型透传上游报 4001。前缀已剥离，此处只处理裸名。
+    let model = wb_model_route::strip_rate_tag(model).unwrap_or(model);
     // v3（P4）：⓪ custom 短路已移除——custom 为独立源，与前缀锁定解耦：
     // 源集合照常收集（下方 sources.custom 填充），前缀锁定只影响候选序
     //（custom/xxx = 单池候选直达；同名多源默认按统一调度规则、custom 尾部兜底）。

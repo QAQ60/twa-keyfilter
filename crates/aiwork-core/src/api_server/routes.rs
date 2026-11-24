@@ -837,6 +837,9 @@ fn whitelist_check(state: &ApiSharedState, model: &str, proto: Protocol) -> Opti
     // （含前缀）——修复此前 `let model = bare.unwrap_or(model)` 遮蔽导致 404
     // 文案显示裸名、与上方注释「保留原始名」矛盾的问题（放行/剥离逻辑不变）
     let stripped = bare.unwrap_or(model);
+    // 展示层倍率后缀（·x0.69/·free）与 dispatch 入口同口径剥离，避免 /v1/models
+    // 发布的带后缀 id 在准入层被白名单误拦（后缀仅用于显示，不是模型身份）
+    let stripped = wb_model_route::strip_rate_tag(stripped).unwrap_or(stripped);
     // issue #38 实测修复：`-max` / `-thinking` 等入口后缀在 dispatch ② 段才剥离，
     // 白名单须按同一剥离规则对基名放行——否则启用白名单的部署下，Max Mode /
     // 路由后缀入口在准入层就被 404 拦截，整个能力不可用（剥离规则与 dispatch 同源，
@@ -1141,6 +1144,22 @@ fn models_entry_visible(
         && !m.sources.iter().all(|s| s.disabled)
 }
 
+/// /v1/models 对外 id 拼倍率后缀（`·x0.69` / `·free`）——Minis 选择器靠 id 后缀
+/// 显示倍率（不读 rate 字段），与 Cloudflare 主线 worker 同口径。rate 缺失/NaN
+/// 不拼后缀；0 拼 `·free`。调用入口 dispatch/白名单均会剥回裸名，不影响路由。
+fn model_id_with_rate(id: &str, rate: Option<f64>) -> String {
+    match rate {
+        Some(r) if r.is_finite() => {
+            if r <= 0.0 {
+                format!("{id}·free")
+            } else {
+                format!("{id}·x{:g}", r)
+            }
+        }
+        _ => id.to_string(),
+    }
+}
+
 pub async fn models(
     State(state): State<Arc<ApiSharedState>>,
     Extension(key_id): Extension<KeyId>,
@@ -1252,7 +1271,7 @@ pub async fn models(
         .filter(|m| entry_visible(m))
         .map(|m| {
             json!({
-                "id": m.id,
+                "id": model_id_with_rate(&m.id, m.rate),
                 "object": "model",
                 "created": 1753600000,
                 "owned_by": "unified",
@@ -1289,7 +1308,7 @@ pub async fn models(
                         .unwrap_or(true)
             }) {
                 data.push(json!({
-                    "id": format!("{}/{}", s.pool, m.id),
+                    "id": model_id_with_rate(&format!("{}/{}", s.pool, m.id), s.rate),
                     "object": "model",
                     "created": 1753600000,
                     "owned_by": "unified",

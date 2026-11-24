@@ -233,6 +233,27 @@ pub fn strip_route_suffix(name: &str, cfg: &WbRouteFile) -> Option<(String, Opti
     None
 }
 
+/// 剥离展示层倍率后缀（与 Cloudflare 主线 worker 的 stripMulTag 同口径）。
+/// /v1/models 对外 id 拼 `·x0.69` / `·free` 供 Minis 选择器显示倍率；调用入口
+/// 必须剥回裸名才能真正路由。只剥**末尾**一段 `·x<数字>` 或 `·free`，中间段
+/// 不动；无后缀返回 None。字符级切分避免多字节切片越界。
+pub fn strip_rate_tag(name: &str) -> Option<&str> {
+    let idx = name.rfind('·')?;
+    let tail = &name[idx + '·'.len_utf8()..];
+    let ok = tail == "free"
+        || (tail.starts_with('x')
+            && tail.len() > 1
+            && tail[1..].chars().all(|c| c.is_ascii_digit() || c == '.'));
+    if !ok {
+        return None;
+    }
+    let base = &name[..idx];
+    if base.trim().is_empty() {
+        return None;
+    }
+    Some(base)
+}
+
 /// 跨池 Max Mode 后缀剥离（issue #31 T4.2）：纯字符串剥离内置 `-max`（不查目录），
 /// 返回基名（无 effort 提示——max_mode 与档位正交）。仅 dispatch Trae 分支调用，
 /// 剥离成功不代表可服务：基名是否可由 Trae 提供由 dispatch 查 Trae 模型列表判定，
@@ -364,6 +385,20 @@ mod tests {
     use super::*;
     use crate::api_server::wb_catalog;
     use serde_json::json;
+
+    #[test]
+    fn strip_rate_tag_t01() {
+        // 展示层倍率后缀剥离：与 /v1/models 拼后缀口径一致，调用入口剥回裸名
+        assert_eq!(super::strip_rate_tag("glm-5.3·x0.69"), Some("glm-5.3"));
+        assert_eq!(super::strip_rate_tag("trae/glm-5.3·x0.78"), Some("trae/glm-5.3"));
+        assert_eq!(super::strip_rate_tag("hy4flash-free·free"), Some("hy4flash-free"));
+        assert_eq!(super::strip_rate_tag("qwen3.8-max·x1.5"), Some("qwen3.8-max"));
+        // 无后缀 / 非法后缀原样 None（调用方 unwrap_or 保持原名）
+        assert_eq!(super::strip_rate_tag("glm-5.3"), None);
+        assert_eq!(super::strip_rate_tag("glm-5.3·x"), None);
+        assert_eq!(super::strip_rate_tag("glm-5.3·abc"), None);
+        assert_eq!(super::strip_rate_tag("·x0.5"), None);
+    }
 
     fn catalog() -> Vec<wb_catalog::WbModel> {
         wb_catalog::builtin()
