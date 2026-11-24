@@ -1276,6 +1276,11 @@ pub async fn models(
                 "created": 1753600000,
                 "owned_by": "unified",
                 "display": m.display,
+                // 干净展示名（不含倍率）：Minis 选择器第二行优先读 name/display_name，
+                // 有此字段就不会回退到带倍率后缀的 id，避免两行重复倍率。
+                // display 来自官方动态目录 label，倍率仍由 id 后缀动态携带（同源 rate）。
+                "name": m.display,
+                "display_name": m.display,
                 "rate": m.rate,
                 "context_length": m.context_length,
                 "max_tokens": m.max_tokens,
@@ -1313,6 +1318,9 @@ pub async fn models(
                     "created": 1753600000,
                     "owned_by": "unified",
                     "display": format!("[{}] {}", s.pool, m.display),
+                    // 干净展示名（同上，第二行不回退带倍率 id）
+                    "name": m.display,
+                    "display_name": m.display,
                     "rate": s.rate,
                     "context_length": m.context_length,
                     "max_tokens": m.max_tokens,
