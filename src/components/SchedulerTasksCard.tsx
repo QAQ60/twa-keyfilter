@@ -303,8 +303,14 @@ export default function SchedulerTasksCard({
                           title="间隔小时数（1-24，失焦保存；距上次成功满间隔才再跑）"
                         />
                       )}
-                    {t && t.mode === 'every6h' ? (
-                      <Badge tone="violet" title="固定周期任务：每 6 小时自动执行一次，触发时刻不可配置">
+                    {/* 周期文字类任务（每N小时/每N天/每小时/已关闭）直接显示 Badge，
+                        不渲染 time input（value 为“每N小时”塞进 type=time 会失效/空白，
+                        正是 Qoder 快照/会话合并任务“时间看不见”的根因）。
+                        HOURLY_TASKS 且非 daily 时前面已有模式选择器+间隔数字框，这里跳过避免重复。 */}
+                    {t &&
+                    !/^\d{1,2}:\d{2}$/.test(t.time) &&
+                    !(HOURLY_TASKS.includes(key) && modes[key] !== 'daily') ? (
+                      <Badge tone="violet" title="周期性任务，由服务端按间隔自动执行，触发时刻不可配置">
                         {t.time}
                       </Badge>
                     ) : (
