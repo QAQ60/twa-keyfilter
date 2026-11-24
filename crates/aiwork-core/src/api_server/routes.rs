@@ -1153,7 +1153,7 @@ fn model_id_with_rate(id: &str, rate: Option<f64>) -> String {
             if r <= 0.0 {
                 format!("{id}·free")
             } else {
-                format!("{id}·x{:g}", r)
+                format!("{id}·x{}", r)
             }
         }
         _ => id.to_string(),
