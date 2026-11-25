@@ -1266,12 +1266,29 @@ pub async fn models(
     // 不受此限，仍可见以便重新启用）
     let entry_visible =
         |m: &unified_catalog::UnifiedModel| models_entry_visible(m, wb_enabled, buddy_ai_enabled);
+    // 绑定池 key：目录 rate 取「key 实际会命中的那个池」的倍率，而非全局
+    // POOL_FIXED_ORDER 命中侧（默认 Buddy 优先）。绑定 key 的调度被
+    // bind_pool_order 锁在该池，展示别的池倍率会让客户端按错误价格比价
+    //（trae 绑定的 key：deepseek-v4.1-flash 实扣 0.06，却显示 buddy 的 0.11）。
+    // 该池未声明 rate → 回退原 m.rate，保持既有行为。
+    let rate_of = |m: &unified_catalog::UnifiedModel| -> Option<f64> {
+        match key_bind.as_ref() {
+            Some(bind) => m
+                .sources
+                .iter()
+                .find(|s| !s.disabled && &s.pool == bind)
+                .and_then(|s| s.rate)
+                .or(m.rate),
+            None => m.rate,
+        }
+    };
     let mut data: Vec<Value> = list
         .iter()
         .filter(|m| entry_visible(m))
         .map(|m| {
+            let rate = rate_of(m);
             json!({
-                "id": model_id_with_rate(&m.id, m.rate),
+                "id": model_id_with_rate(&m.id, rate),
                 "object": "model",
                 "created": 1753600000,
                 "owned_by": "unified",
@@ -1281,7 +1298,7 @@ pub async fn models(
                 // display 来自官方动态目录 label，倍率仍由 id 后缀动态携带（同源 rate）。
                 "name": m.display,
                 "display_name": m.display,
-                "rate": m.rate,
+                "rate": rate,
                 "context_length": m.context_length,
                 "max_tokens": m.max_tokens,
                 "supports_image": m.supports_image,

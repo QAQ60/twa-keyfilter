@@ -3504,7 +3504,7 @@ mod tests {
         // 实际消耗记账：余额下降 → 加权虚拟时间按 消耗/权重 递增；
         // 余额上升（充值）不回扣——公平以「消耗」为唯一口径
         let now = now_ts();
-        let soon = now + 3 * 24 * 3600; // u1 权重 2
+        let soon = now + 5 * 24 * 3600; // u1 权重 2（≤7 天档；3 天档已是 4.0）
         let pool = build_pool(&[("u1", 10.0, soon), ("u2", 10.0, 0)]);
         pool.set_strategy(PoolStrategy::FairRotation);
         // 首轮回写建立基线（10.0 → 无消耗）
