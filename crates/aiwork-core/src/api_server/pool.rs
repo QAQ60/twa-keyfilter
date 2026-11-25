@@ -98,10 +98,22 @@ impl PoolStrategy {
 /// 与运行期 update_credits_snapshot 拨新。24h 与 trae-credits-snapshot daily 模式对齐
 const RESERVE_STALE_SECS: i64 = 24 * 3600;
 
-/// 公平轮转：即将到期判定窗口（7 天）与相对权重（2:1）。
-/// 权重只改变份额，不构成硬门槛——无到期时间的账号仍按 1 份持续参与
+/// 公平轮转：即将到期判定窗口（7 天）与分档相对权重。
+/// 权重只改变份额，不构成硬门槛——无到期时间的账号仍按 1 份持续参与。
+///
+/// 分档（距积分作废剩余时长 → 权重）：
+///   ≤1 天 → 8.0，≤3 天 → 4.0，≤7 天 → 2.0，更远/未知 → 1.0
+/// 权重越高份额递增越慢（`score += 1/权重`），因此越接近作废的账号被轮转得
+/// 越频繁，赶在积分作废前把它烧掉。原实现只有「7 天内 = 2.0」一档，最后
+/// 一天的紧迫度与第 7 天相同，容易让临界积分白白过期。
 const URGENT_WINDOW_SECS: i64 = 7 * 24 * 3600;
 const EXPIRING_WEIGHT: f64 = 2.0;
+/// ≤1 天：最紧迫档
+const URGENT_1D_SECS: i64 = 24 * 3600;
+const URGENT_1D_WEIGHT: f64 = 8.0;
+/// ≤3 天：次紧迫档
+const URGENT_3D_SECS: i64 = 3 * 24 * 3600;
+const URGENT_3D_WEIGHT: f64 = 4.0;
 /// 公平轮转：饥饿保护阈值（闲置 ≥ 该秒数进入优先组，防低权重账号被长期饿死）
 const STARVATION_SECS: i64 = 300;
 
@@ -131,11 +143,25 @@ fn cmp_fair_key(a: &(u8, f64, u32, u64), b: &(u8, f64, u32, u64)) -> std::cmp::O
         .then_with(|| a.3.cmp(&b.3))
 }
 
-/// 公平权重：7 天内到期 → 2.0，其余（含无到期时间/已过期判定在 selectable 拦下）→ 1.0
+/// 公平权重：按距积分作废的剩余时长分档，越近权重越高
+/// （含无到期时间/已过期判定在 selectable 拦下 → 1.0）：
+///   ≤1 天 → 8.0，≤3 天 → 4.0，≤7 天 → 2.0，更远 → 1.0
 fn fair_weight(e: &PoolEntry, now: i64) -> f64 {
-    match e.credits_expire_at {
-        Some(exp) if exp > now && exp - now <= URGENT_WINDOW_SECS => EXPIRING_WEIGHT,
-        _ => 1.0,
+    let Some(exp) = e.credits_expire_at else {
+        return 1.0;
+    };
+    let left = exp - now;
+    if left <= 0 {
+        return 1.0;
+    }
+    if left <= URGENT_1D_SECS {
+        URGENT_1D_WEIGHT
+    } else if left <= URGENT_3D_SECS {
+        URGENT_3D_WEIGHT
+    } else if left <= URGENT_WINDOW_SECS {
+        EXPIRING_WEIGHT
+    } else {
+        1.0
     }
 }
 
@@ -3300,10 +3326,58 @@ mod tests {
     }
 
     #[test]
+    fn fair_weight_tiers() {
+        // 分档权重：越接近作废权重越高（份额递增越慢 → 被轮转得越频繁）
+        //   ≤1 天 → 8.0，≤3 天 → 4.0，≤7 天 → 2.0，更远/未知/已过期 → 1.0
+        let now = 1_800_000_000i64;
+        let mk = |exp: Option<i64>| PoolEntry {
+            uid: "u".into(),
+            name: "u".into(),
+            jwt: String::new(),
+            credits: Some(10.0),
+            credits_expire_at: exp,
+            credits_fetched_at: None,
+            disabled: false,
+            err_count: 0,
+            until: 0,
+            reason: String::new(),
+            device_id: String::new(),
+            machine_id: String::new(),
+            hard_until: 0,
+            last_used: 0,
+            successes: 0,
+            failures: 0,
+            cb_trips: 0,
+            domain: String::new(),
+            enterprise_id: String::new(),
+            global_region: false,
+            refresh_invalid: false,
+        };
+        let day = 24 * 3600i64;
+        // ≤1 天档
+        assert_eq!(fair_weight(&mk(Some(now + 3600)), now), 8.0, "1 小时");
+        assert_eq!(fair_weight(&mk(Some(now + day / 2)), now), 8.0, "半天");
+        assert_eq!(fair_weight(&mk(Some(now + day)), now), 8.0, "边界 1 天（含）");
+        // ≤3 天档
+        assert_eq!(fair_weight(&mk(Some(now + day + 1)), now), 4.0, "略超 1 天");
+        assert_eq!(fair_weight(&mk(Some(now + 2 * day)), now), 4.0, "2 天");
+        assert_eq!(fair_weight(&mk(Some(now + 3 * day)), now), 4.0, "边界 3 天（含）");
+        // ≤7 天档
+        assert_eq!(fair_weight(&mk(Some(now + 3 * day + 1)), now), 2.0, "略超 3 天");
+        assert_eq!(fair_weight(&mk(Some(now + 5 * day)), now), 2.0, "5 天");
+        assert_eq!(fair_weight(&mk(Some(now + 7 * day)), now), 2.0, "边界 7 天（含）");
+        // 更远 / 未知 / 已过期 → 1.0
+        assert_eq!(fair_weight(&mk(Some(now + 7 * day + 1)), now), 1.0, "略超 7 天");
+        assert_eq!(fair_weight(&mk(Some(now + 20 * day)), now), 1.0, "20 天");
+        assert_eq!(fair_weight(&mk(None), now), 1.0, "无到期时间");
+        assert_eq!(fair_weight(&mk(Some(now - 1)), now), 1.0, "已过期（selectable 拦下）");
+    }
+
+    #[test]
     fn fair_rotation_weight_gives_more_share_to_expiring() {
-        // 加权份额：7 天内到期账号（权重 2）应获得约 2 倍取号份额（无到期账号 1 份）
+        // 加权份额：5 天后到期账号（权重 2）应获得约 2 倍取号份额（无到期账号 1 份）
         let now = now_ts();
-        let soon = now + 3 * 24 * 3600; // 3 天后到期 → 权重 2
+        let soon = now + 5 * 24 * 3600; // 5 天后到期 → 权重 2（≤7天档）
         let pool = build_pool(&[("u1", 10.0, soon), ("u2", 10.0, 0)]);
         pool.set_strategy(PoolStrategy::FairRotation);
         let (mut c1, mut c2) = (0usize, 0usize);
