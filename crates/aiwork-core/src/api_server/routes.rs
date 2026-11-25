@@ -1271,8 +1271,9 @@ pub async fn models(
     // bind_pool_order 锁在该池，展示别的池倍率会让客户端按错误价格比价
     //（trae 绑定的 key：deepseek-v4.1-flash 实扣 0.06，却显示 buddy 的 0.11）。
     // 该池未声明 rate → 回退原 m.rate，保持既有行为。
+    // 注：key_bind 已 move 进上面的 spawn_blocking，这里用 clone 出的副本
     let rate_of = |m: &unified_catalog::UnifiedModel| -> Option<f64> {
-        match key_bind.as_ref() {
+        match key_bind_for_alias.as_ref() {
             Some(bind) => m
                 .sources
                 .iter()
