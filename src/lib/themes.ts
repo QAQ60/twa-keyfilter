@@ -28,6 +28,9 @@ export function resolveTheme(
     if (hit) return hit;
     if (raw === 'light') return THEMES[0];
     if (raw === 'dark') return THEMES[1];
+    // 跟随系统：下拉框「跟随系统」落库值就是 system，必须按系统偏好解析，
+    // 否则落到下方「未知值→默认深色」分支，选了跟没选一样（写死 charcoal）
+    if (raw === 'system') return systemPrefersDark ? THEMES[1] : THEMES[0];
     // 未知主题值归一为默认主题，避免外部脏数据落库后 UI 走兜底分支不一致
     return THEMES.find((t) => t.id === DEFAULT_THEME) ?? THEMES[1];
   }
