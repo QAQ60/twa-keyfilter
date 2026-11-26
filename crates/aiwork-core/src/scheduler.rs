@@ -138,9 +138,16 @@ const REFRESH_INTERVAL_HOURS: i64 = 6;
 const COMPACT_INTERVAL_HOURS: i64 = 6;
 
 /// 可配置「每小时/每N小时」模式的任务（看板数据同步类，移植 main@c8e855b 的 credits 语义）：
-/// 仅这些任务接受 scheduler_cfg.task_modes 的 hourly/every_hours 值，其余任务恒为每日模式
-const HOURLY_CAPABLE: &[&str] =
-    &["wb-credits-snapshot", "trae-credits-snapshot", "trae-usage-sync", "qoder-credits-snapshot"];
+/// 仅这些任务接受 scheduler_cfg.task_modes 的 hourly/every_hours 值，其余任务恒为每日模式。
+/// models-sync 于 2026-11 加入：官网改价当天就想跟上，每日 05:40 单点最长滞后 24h，
+/// 该任务不消耗积分（batch_get_detail_param），加密到每 2 小时无成本
+const HOURLY_CAPABLE: &[&str] = &[
+    "wb-credits-snapshot",
+    "trae-credits-snapshot",
+    "trae-usage-sync",
+    "qoder-credits-snapshot",
+    "models-sync",
+];
 
 /// 单任务的生效调度计划：Skip=关闭；Daily=每日 HH:MM（到点+当日未跑，启动补跑）；
 /// Hourly=每小时（距上次成功执行 ≥1h，无记录=首次立即跑）；

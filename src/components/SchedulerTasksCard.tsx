@@ -32,7 +32,7 @@ const TASK_DESC: Record<string, string> = {
 };
 
 /** 可配置「每小时/每N小时」模式的任务（看板数据同步类，与服务端 HOURLY_CAPABLE 对齐） */
-const HOURLY_TASKS = ['wb-credits-snapshot', 'trae-credits-snapshot', 'trae-usage-sync'];
+const HOURLY_TASKS = ['wb-credits-snapshot', 'trae-credits-snapshot', 'trae-usage-sync', 'models-sync'];
 
 /** 外部接管开关（wb-checkin → settings.auto_checkin）：checked + 切换回调 */
 export interface TaskToggleOverride {

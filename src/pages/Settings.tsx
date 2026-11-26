@@ -161,7 +161,7 @@ export default function Settings() {
         {/* 右列：定时任务（开关即时保存，含最近执行状态；推荐配置 = 全部启用） */}
         <SchedulerTasksCard
           taskKeys={['trae-jwt-renew', 'models-sync', 'trae-checkin', 'trae-credits-snapshot']}
-          desc="服务端内置调度器每日自动执行，覆盖自动续期 / 自动签到 / 自动同步服务器数据（模型列表 + 积分看板）。推荐保持全部启用。"
+          desc="服务端内置调度器自动执行，覆盖自动续期 / 自动签到 / 自动同步服务器数据（模型列表 + 积分看板）。模型目录与看板类任务可选每小时/每 N 小时，签到类为每日定点。推荐保持全部启用。"
         />
       </div>
 
