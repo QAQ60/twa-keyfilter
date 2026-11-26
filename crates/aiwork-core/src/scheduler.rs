@@ -1654,18 +1654,46 @@ mod sched_plan_tests {
     }
 
     /// 自定义时刻覆盖默认；缺省回落内置默认时刻
+    /// 用 trae-checkin 作样本：models-sync 已并入 HOURLY_CAPABLE（默认 every_hours），
+    /// 不再是每日定点任务
     #[test]
     fn custom_time_overrides_default() {
         let st = temp_state("times");
-        let cfg = json!({ "task_times": { "models-sync": "08:15" } });
-        let t = task("models-sync");
+        let cfg = json!({ "task_times": { "trae-checkin": "08:15" } });
+        let t = task("trae-checkin");
         match sched_plan(&st, &cfg, t) {
             SchedPlan::Daily(hhmm) => assert_eq!(hhmm, "08:15"),
-            _ => panic!("models-sync 应为每日计划"),
+            _ => panic!("trae-checkin 应为每日计划"),
         }
         match sched_plan(&st, &json!({}), t) {
             SchedPlan::Daily(hhmm) => assert_eq!(hhmm, t.hhmm),
-            _ => panic!("models-sync 应为每日计划"),
+            _ => panic!("trae-checkin 应为每日计划"),
+        }
+    }
+
+    /// models-sync 默认每 2 小时（脱离每日 05:40 单点），可被 task_modes 覆盖
+    #[test]
+    fn models_sync_defaults_to_every_2h() {
+        let st = temp_state("msync");
+        let t = task("models-sync");
+        match sched_plan(&st, &json!({}), t) {
+            SchedPlan::EveryHours(h) => assert_eq!(h, 2),
+            other => panic!("models-sync 默认应为每 2 小时，实际 {other:?}"),
+        }
+        // 显式 daily 仍可回到定点
+        let cfg = json!({ "task_modes": { "models-sync": "daily" } });
+        assert!(matches!(sched_plan(&st, &cfg, t), SchedPlan::Daily(_)));
+        // 显式 hourly
+        let cfg = json!({ "task_modes": { "models-sync": "hourly" } });
+        assert!(matches!(sched_plan(&st, &cfg, t), SchedPlan::Hourly));
+        // 自定义间隔
+        let cfg = json!({
+            "task_modes": { "models-sync": "every_hours" },
+            "task_hours": { "models-sync": 6 },
+        });
+        match sched_plan(&st, &cfg, t) {
+            SchedPlan::EveryHours(h) => assert_eq!(h, 6),
+            other => panic!("应尊重自定义间隔 6h，实际 {other:?}"),
         }
     }
 
