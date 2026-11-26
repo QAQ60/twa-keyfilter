@@ -50,7 +50,8 @@ jobs:
 
   build-push:
     name: 构建并推送镜像（GHCR）
-    needs: [rust, web]
+    # 与 rust/web 并行：镜像构建不再等门禁。门禁失败时 merge 不执行，
+    # 因此镜像不会被贴上 latest 等标签，线上不会拿到未过测的构建
     if: github.event_name != 'pull_request'
     strategy:
       fail-fast: false
@@ -117,7 +118,9 @@ jobs:
 
   merge:
     name: 合并多架构 manifest（GHCR）
-    needs: build-push
+    # 门禁在此收口：rust/web 任一失败 → 本 job 不执行 → 镜像不打任何 tag
+    # （build-push 推的是 push-by-digest，无 tag，无法被部署引用）
+    needs: [rust, web, build-push]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
@@ -171,4 +174,6 @@ jobs:
       - name: 校验多架构 manifest
         run: |
           docker buildx imagetools inspect \
+            ${{ env.REGISTRY }}/${{ steps.img.outputs.image }}:${{ steps.ver.outputs.version }}
+pect \
             ${{ env.REGISTRY }}/${{ steps.img.outputs.image }}:${{ steps.ver.outputs.version }}
