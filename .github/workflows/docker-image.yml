@@ -175,5 +175,3 @@ jobs:
         run: |
           docker buildx imagetools inspect \
             ${{ env.REGISTRY }}/${{ steps.img.outputs.image }}:${{ steps.ver.outputs.version }}
-pect \
-            ${{ env.REGISTRY }}/${{ steps.img.outputs.image }}:${{ steps.ver.outputs.version }}
