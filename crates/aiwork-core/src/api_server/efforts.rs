@@ -84,7 +84,19 @@ pub fn trae_declared_unified(canonical: &str) -> Vec<String> {
 
 // ==================== L3 文档参考表（Trae Max Mode，issue #31 T4.1） ====================
 
-/// Trae Max Mode 支持表（2026-09 T0.3 客户端实证 + docs.trae.cn/ide_max-mode）：
+/// Trae Max Mode 支持表 —— **仅为静态兜底**（issue #T4.3 起降级）。
+///
+/// ★ 权威口径是 `models_sync::trae_max_mode_supported`：读官方目录
+/// `context_window_tokens.{dev,max}`，`max > dev` 即支持（每 2h 同步，
+/// 新上架模型自动跟上）。本表只在「目录里没有该条目」（未同步/离线）时回落，
+/// 避免把已验证可用的老模型在缺数据时误判为不支持。
+///
+/// 2026-11-27 与线上目录比对：本表 12 条里 5 条已下架（glm-5.2 /
+/// deepseek-v4-pro / deepseek-v4-flash / deepseek-v4-flash-official /
+/// qwen-3.7-plus），另有 11 个模型目录声明 `max > dev` 却不在表内 —— 这正是
+/// 改为动态判定的原因（否则「声明 1M 却永不注入 is_max_mode」的错位会反复发生）。
+///
+/// 原文档（2026-09 T0.3 客户端实证 + docs.trae.cn/ide_max-mode）：
 /// Max Mode 为请求级布尔字段 `is_max_mode:true` 注入（issue #38 实测：布尔 true
 /// 可用，数值 1 被上游 4001 拒绝；客户端 `isMaxMode?1:0` 疑为 UI 门控表达式），
 /// 非模型名变体；支持集取官方文档 Max Mode 1M 上下文档（原
@@ -110,7 +122,13 @@ pub const TRAE_MAX_MODE_REF: [&str; 12] = [
 ];
 
 /// Trae 模型是否支持 Max Mode（canonical 查表；表外 → false 不注入）
-pub fn trae_max_mode_supported(canonical: &str) -> bool {
+/// Max Mode 静态兜底表是否收录该模型（**仅供 `models_sync` 回落使用**）。
+///
+/// ⚠️ 不要用它做「是否支持 Max Mode」的判定 —— 唯一权威判定是
+/// `models_sync::trae_max_mode_supported(data_dir, model)`（读官方目录
+/// `max > dev`，目录未收录才回落到本函数）。保留此函数是为了让回落路径
+/// 只有一处实现，不另写 `TRAE_MAX_MODE_REF.contains(..)`。
+pub fn trae_max_mode_static_fallback(canonical: &str) -> bool {
     TRAE_MAX_MODE_REF.contains(&canonical)
 }
 
@@ -278,15 +296,19 @@ mod tests {
         assert!(declared_union(&[vec![], vec![]]).is_empty());
     }
 
-    /// Max Mode 支持表：表内命中；表外/空串不命中
+    /// Max Mode **静态兜底表**：表内命中（仅用于官方目录未收录时的回落）。
+    ///
+    /// ★ 支持判定的主口径是 `models_sync::trae_max_mode_supported`（读官方目录
+    /// `max > dev`）；本表只在目录缺失时生效。因此这里断言的是「兜底表内容」，
+    /// 不再声称它是权威支持集合 —— `glm-5.3-flashx` 之类已改为由目录判定
+    /// （实测其 max=1M > dev=200K，目录口径下**支持**）。
     #[test]
-    fn t07_max_mode_supported() {
-        assert!(trae_max_mode_supported("glm-5.3"));
-        assert!(trae_max_mode_supported("glm-5.3-flash"));
-        assert!(trae_max_mode_supported("qwen3.8-max"));
-        assert!(trae_max_mode_supported("doubao-seed-evolving"));
-        assert!(!trae_max_mode_supported("doubao-seed-code"));
-        assert!(!trae_max_mode_supported("glm-5.3-flashx"));
-        assert!(!trae_max_mode_supported(""));
+    fn t07_max_mode_static_fallback_table() {
+        assert!(TRAE_MAX_MODE_REF.contains(&"glm-5.3"));
+        assert!(TRAE_MAX_MODE_REF.contains(&"glm-5.3-flash"));
+        assert!(TRAE_MAX_MODE_REF.contains(&"qwen3.8-max"));
+        assert!(TRAE_MAX_MODE_REF.contains(&"doubao-seed-evolving"));
+        assert!(!TRAE_MAX_MODE_REF.contains(&"doubao-seed-code"));
+        assert!(!TRAE_MAX_MODE_REF.contains(&""));
     }
 }

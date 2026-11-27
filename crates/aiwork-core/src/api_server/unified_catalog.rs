@@ -484,6 +484,9 @@ pub fn unified_models_ex(
     let mut custom_img: HashMap<String, bool> = HashMap::new();
 
     // 源1：Trae（先入者；同 canonical 的 wb 条目随后合并）
+    // Max Mode 支持表（issue #T4.3）：官方目录 `max > dev` 一次性建表，
+    // 目录未收录的模型回落静态白名单（见 models_sync::trae_max_mode_map）
+    let max_mode_map = super::models_sync::trae_max_mode_map(data_dir);
     for m in &trae_list {
         let canonical = canonical_id(&m.id);
         if canonical.is_empty() || acc.contains_key(&canonical) {
@@ -501,7 +504,12 @@ pub fn unified_models_ex(
                 region: None,
                 rate: t.rate,
                 efforts: t.efforts.clone(),
-                max_mode: super::efforts::trae_max_mode_supported(&canonical),
+                // Max Mode 支持（issue #T4.3）：优先读官方目录 `max > dev`
+                // （每 2h 同步的真实数据），目录未收录时回落静态表。
+                // 用循环外建好的批量表，避免逐模型重复扫目录
+                max_mode: max_mode_map.get(&canonical).copied().unwrap_or_else(|| {
+                    super::efforts::trae_max_mode_static_fallback(&canonical)
+                }),
                 context_length: t.context_length,
                 max_tokens: t.max_tokens,
                 supports_image: t.supports_image,

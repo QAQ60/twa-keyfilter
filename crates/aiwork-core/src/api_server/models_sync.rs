@@ -105,6 +105,138 @@ pub fn function_for_model(model_lower: &str) -> &'static str {
     }
 }
 
+/// Max Mode 的**官方目录判定**（issue #T4.3）：`max > dev` ⇒ 该模型支持 Max Mode。
+///
+/// ## 为什么不再只靠硬编码白名单
+///
+/// 原实现用 `efforts::TRAE_MAX_MODE_REF` 常量表（12 条）门控 `is_max_mode` 注入。
+/// 2026-11-27 与线上目录逐条比对，发现三类漂移：
+/// - **表内已下架**（glm-5.2 / deepseek-v4-pro / deepseek-v4-flash /
+///   deepseek-v4-flash-official / qwen-3.7-plus）——占位但永不命中；
+/// - **目录声明 `max > dev` 但不在表内**（deepseek-v4.1-flash / glm-5.4 /
+///   glm-5.3-flashx / kimi-k3.1-pro(-highspeed) / minimax-m3.1-flash /
+///   mimo-v2.6-pro(-flash) / qwen3.8-flash / qwen4-max / step-5-preview /
+///   Doubao-Seed-2.1-Pro）——**声明 1M 却永不注入**，客户端发到 20 万以上
+///   被上游 11115 拒；`context_window::trae_set` 也因查表被拒（「不支持长上下文」）；
+/// - 每次官方上新模型都要改代码发版。
+///
+/// 目录是每 2 小时同步一次的真实数据（`context_window_tokens.{dev,max}` 双槽
+/// 早已落库），判定改为读它即可自动跟随官方节奏。
+///
+/// ## 回退语义（**缺数据不猜**）
+///
+/// - 目录有条目且 `dev`、`max` 都有 ⇒ 按 `max > dev` 判定（唯一权威口径）；
+/// - 目录条目 `dev` 有值而 `max` 缺失 ⇒ **不支持**（上游明确声明「没有更高的
+///   上限档」，回落白名单会把 1M 谎报成可用）；
+/// - 目录条目 `dev` 本身缺失（占位清单，如 `default_models()` 不预置 L2 元数据）
+///   ⇒ **回落**静态表（那是「不知道」，不是「没有」）；
+/// - 目录**没有**该条目（同步未跑 / 新模型尚未同步 / 离线）⇒ 同样回落静态表，
+///   保住既有已验证行为。
+pub fn trae_max_mode_supported(data_dir: &Path, model: &str) -> bool {
+    let canonical = super::unified_catalog::canonical_id(model);
+    if canonical.is_empty() {
+        return false;
+    }
+    trae_max_mode_map(data_dir)
+        .get(&canonical)
+        .copied()
+        .unwrap_or_else(|| super::efforts::trae_max_mode_static_fallback(&canonical))
+}
+
+/// 批量形态：[`trae_max_mode_supported`] 的全表版（`canonical_id → 是否支持`）。
+///
+/// 目录聚合（`unified_models_ex`）逐模型判定时不要每条都调单模型版——虽然
+/// [`load_models`] 有 `config_cache` 兜底，但每次仍要线性扫一遍目录。
+/// 这里一次建表，热路径退化为一次 HashMap 查询。
+///
+/// **只含目录里确实有条目的模型**：不在返回表里的模型由调用方按
+/// [`super::efforts::trae_max_mode_static_fallback`] 静态表兜底（离线/未同步）。
+pub fn trae_max_mode_map(data_dir: &Path) -> std::collections::HashMap<String, bool> {
+    let mut map = std::collections::HashMap::new();
+    for m in load_models(data_dir) {
+        let canonical = super::unified_catalog::canonical_id(&m.id);
+        if canonical.is_empty() {
+            continue;
+        }
+        // ★ `context_length` 缺失 = **不知道**（`default_models()` 这类占位清单
+        //   不预置 L2 元数据），不是「没有上限档」⇒ 不入表，让调用方回落静态
+        //   白名单。否则新装/未同步环境会把 glm-5.3 这类已验证模型误判为不支持，
+        //   连 `-max` 后缀与长上下文开关一起失效。
+        let Some(dev) = m.context_length else { continue };
+        // dev 有值、max 缺失 ⇒ 上游明确「没有更高的上限档」→ 不支持
+        let supported = m.context_length_max.map_or(false, |max| max > dev);
+        // 同 canonical 多条目时「可支持」优先：目录里同名条目理论上一致，
+        // 但历史数据可能残留旧快照，取「有一处声明支持即支持」更不容易误伤
+        map.entry(canonical)
+            .and_modify(|v| *v = *v || supported)
+            .or_insert(supported);
+    }
+    map
+}
+
+/// Trae 侧**实际生效窗口**（issue #T4.4）：Trae 到底会给这个模型多大上下文。
+///
+/// ## 为什么需要一个「生效窗口」而不是直接报目录里的 max
+///
+/// 目录里 `context_window_tokens.{dev,max}` 是**两档**：
+/// - `dev`：`__dev` 通道实际可用窗口（不开 Max Mode 就只有这么大）；
+/// - `max`：Max Mode 上限（**必须请求注入 `is_max_mode:true` 才拿得到**）。
+///
+/// 历史 bug（2026-11-27 实测）：统一目录把双源条目的上下文取自「调度命中侧」，
+/// 而未绑定的调度默认 Buddy 优先 ⇒ `deepseek-v4.1-flash` 声明了 **Buddy 侧的
+/// 1M**，但绑 trae 的 key 实际走 `__dev` 通道 **200K**，且 `is_max_mode` 从未
+/// 注入（模型当时不在静态白名单）⇒ 客户端按 1M 规划、发到 20 万以上被上游
+/// `11115 prompt is too long` 拒。
+///
+/// 判定规则与「注入决策」严格同源（[`trae_wants_max`] 是该决策的唯一出口）：
+/// - 未开 Max Mode → 声明 `dev`（诚实：只有这么大）；
+/// - 已开且支持 → 声明 `max`（请求会注入 `is_max_mode:true`，拿得到）。
+///
+/// 目录未收录 → `None`（调用方保留原声明，不猜数字）。
+pub fn trae_effective_window(data_dir: &Path, model: &str) -> Option<u64> {
+    let canonical = super::unified_catalog::canonical_id(model);
+    if canonical.is_empty() {
+        return None;
+    }
+    let list = load_models(data_dir);
+    let m = list
+        .iter()
+        .find(|m| super::unified_catalog::canonical_id(&m.id) == canonical)?;
+    let dev = m.context_length?;
+    // max 缺失 / 不大于 dev ⇒ 无上限档，实际只有 dev 这么大
+    let supported = m.context_length_max.map_or(false, |max| max > dev);
+    if supported && super::context_window::trae_wants_max(data_dir, &canonical) {
+        return Some(m.context_length_max.unwrap_or(dev));
+    }
+    Some(dev)
+}
+
+/// 批量形态：[`trae_effective_window`] 的全表版（`canonical_id → 生效窗口`）。
+/// 目录聚合逐模型取值时用，避免重复扫目录 + 重复读长上下文开关表。
+pub fn trae_effective_window_map(data_dir: &Path) -> std::collections::HashMap<String, u64> {
+    // 长上下文开关表只读一次（热路径整表反序列化，别放进循环）
+    let wants = super::context_window::trae_list(data_dir);
+    let mut map = std::collections::HashMap::new();
+    for m in load_models(data_dir) {
+        let canonical = super::unified_catalog::canonical_id(&m.id);
+        let Some(dev) = m.context_length else { continue };
+        if canonical.is_empty() {
+            continue;
+        }
+        let supported = m.context_length_max.map_or(false, |max| max > dev);
+        let window = if supported && wants.contains(&canonical) {
+            m.context_length_max.unwrap_or(dev)
+        } else {
+            dev
+        };
+        // 同 canonical 多条目：取较大值（与 trae_max_mode_map 的「有一处支持即支持」同向）
+        map.entry(canonical)
+            .and_modify(|v: &mut u64| *v = (*v).max(window))
+            .or_insert(window);
+    }
+    map
+}
+
 /// 查表优先的 function 解析（官方新上架模型免改代码的关键路径）：
 /// 同步落库的来源视图非空则直接采用；表内未收录或视图为空 → 硬编码回退。
 /// `model_lower` 须为小写化后的请求模型名（调用方 to_lowercase）；
@@ -957,5 +1089,87 @@ mod tests {
         let (_, ctx2, ctx_max2, _, _) = extract_meta(&ci_max_only);
         assert_eq!(ctx2, None, "仅 max 时 dev 槽为 None，不回落声明值");
         assert_eq!(ctx_max2, Some(1_000_000));
+    }
+
+    // ==================== Max Mode 动态判定（issue #T4.3） ====================
+
+    fn seed(dir: &std::path::Path, list: Vec<ModelOption>) {
+        crate::store::db(dir).kv_set("api_models", &list).unwrap();
+        super::super::config_cache::invalidate(dir, "api_models");
+    }
+
+    fn opt(id: &str, dev: Option<u64>, max: Option<u64>) -> ModelOption {
+        ModelOption {
+            id: id.into(),
+            label: id.into(),
+            rate: None,
+            context_length: dev,
+            context_length_max: max,
+            efforts: Vec::new(),
+            supports_image: None,
+            function: String::new(),
+        }
+    }
+
+    /// 目录 `max > dev` ⇒ 支持；`max == dev` / `max` 缺失 ⇒ 不支持。
+    /// 这条替换了原先「硬编码表说了算」的口径：官方上新模型后目录一同步即自动生效。
+    #[test]
+    fn max_mode_follows_catalog_dev_vs_max() {
+        let dir = std::env::temp_dir()
+            .join(format!("modelsync_maxmode_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        seed(
+            &dir,
+            vec![
+                // 官方目录真实口径（2026-11-27 线上快照）
+                opt("deepseek-v4.1-flash", Some(200_000), Some(1_000_000)),
+                opt("glm-5.4", Some(200_000), Some(1_000_000)),
+                opt("kimi-k3.1-pro", Some(200_000), Some(1_000_000)),
+                opt("mimo-v2.6-pro", Some(200_000), Some(981_504)),
+                // 上限档与默认档相同 ⇒ 没有更高上限
+                opt("Doubao-Seed-Code", Some(256_000), Some(256_000)),
+                // dev 有值、max 缺失 ⇒ 上游明确无上限档
+                opt("only-dev-model", Some(200_000), None),
+            ],
+        );
+
+        // 历史上「声明 1M 却不在静态白名单」的那批，现在必须判定为支持
+        assert!(trae_max_mode_supported(&dir, "deepseek-v4.1-flash"));
+        assert!(trae_max_mode_supported(&dir, "glm-5.4"));
+        assert!(trae_max_mode_supported(&dir, "kimi-k3.1-pro"));
+        assert!(trae_max_mode_supported(&dir, "MiMo-V2.6-Pro"), "canonical 归一");
+
+        assert!(!trae_max_mode_supported(&dir, "Doubao-Seed-Code"), "max == dev");
+        assert!(!trae_max_mode_supported(&dir, "only-dev-model"), "max 缺失 = 无上限档");
+        assert!(!trae_max_mode_supported(&dir, ""), "空 id 恒 false");
+
+        // 生效窗口与注入决策同源：未开 Max Mode → dev；开了且支持 → max
+        assert_eq!(trae_effective_window(&dir, "deepseek-v4.1-flash"), Some(200_000));
+        super::super::context_window::trae_set(&dir, "deepseek-v4.1-flash", true).unwrap();
+        assert_eq!(
+            trae_effective_window(&dir, "deepseek-v4.1-flash"),
+            Some(1_000_000),
+            "开 Max Mode 后声明上限档（请求会注入 is_max_mode）"
+        );
+        // 无上限档的模型即便强行开启（表内），生效窗口也不变
+        assert_eq!(trae_effective_window(&dir, "Doubao-Seed-Code"), Some(256_000));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 目录未收录（离线 / 同步未跑 / 占位清单）⇒ 回落静态白名单，
+    /// 保住既有已验证行为，不得把老模型判成不支持。
+    #[test]
+    fn max_mode_falls_back_to_static_table_when_catalog_missing() {
+        let dir = std::env::temp_dir()
+            .join(format!("modelsync_maxmode_fb_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 空目录：load_models 会写入 default_models()（不预置 L2 元数据）
+        assert!(trae_max_mode_supported(&dir, "glm-5.3"), "占位清单应回落静态表");
+        assert!(trae_max_mode_supported(&dir, "glm-5.3-flash"));
+        assert!(!trae_max_mode_supported(&dir, "doubao-seed-code"), "静态表外仍不支持");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

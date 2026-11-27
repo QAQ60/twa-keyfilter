@@ -14,6 +14,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use super::custom_route;
 use super::dispatch::{self, DispatchError, TargetPool};
 use super::efforts;
+use super::models_sync;
 use super::retry::{retry_plan, RetryAction};
 use super::sse;
 use super::unified_catalog;
@@ -322,7 +323,7 @@ fn inject_trae_outbound(
     // Trae 页「长上下文」开关（context_window::trae_wants_max）与 `-max` 入口为「或」关系：
     // 开关只能开启、不关闭显式 -max；同受 Max Mode 支持表门控
     let inject_max = (max_mode_hint || ctx_max)
-        && efforts::trae_max_mode_supported(&unified_catalog::canonical_id(model));
+        && models_sync::trae_max_mode_supported(data_dir, &unified_catalog::canonical_id(model));
     let rewrite_model = requested_model != model;
     if wire.is_none() && !inject_max && !rewrite_model {
         return body_vec;
@@ -1160,6 +1161,31 @@ fn model_id_with_rate(id: &str, rate: Option<f64>) -> String {
     }
 }
 
+/// 对客户端声明的上下文窗口上限（**保守口径**，issue #T4.5）。
+///
+/// ## 为什么不直接报满值 1M
+///
+/// 上游硬限是 **1,048,576** token，但客户端用的是**自己的** tokenizer 估算
+/// prompt —— 实测普遍偏低 10~15%。两边一叠加，「客户端认为还差 5 万才满」时
+/// 上游已经回 `11115 prompt is too long`。
+///
+/// 更隐蔽的是第三方切换器：不少工具拿这个值按 **×90%** 生成
+/// `auto_compact_token_limit`。按 1M 算出 900k，等它真到 900k 时真实 prompt
+/// 已越界 ⇒ 压缩请求本身也带这份超长 prompt ⇒ 同样 400 ⇒ **死锁**（压不下去也
+/// 发不出去）。参考实现 2026-11-09 实证：`1048723 tokens > 1048576 maximum`，
+/// **只超 147 token**。
+///
+/// 因此对客户端统一声明 **900k**，把 14% 余量留给估算误差。真实上限仍在
+/// 管理面（`api_unified_models` 命令返回原始值），那里不需要客户端做阈值决策。
+pub const CLIENT_SAFE_CONTEXT_WINDOW: u64 = 900_000;
+
+/// 把目录里的窗口收窄到客户端安全档（**只降不升**）。
+/// 小于等于安全档的模型（192K / 200K / 256K 等）原样返回：压它们没有收益，
+/// 反而会让用户误以为上游缩水了。
+pub fn client_safe_window(window: u64) -> u64 {
+    window.min(CLIENT_SAFE_CONTEXT_WINDOW)
+}
+
 pub async fn models(
     State(state): State<Arc<ApiSharedState>>,
     Extension(key_id): Extension<KeyId>,
@@ -1204,8 +1230,13 @@ pub async fn models(
     // source_labels：别名条目跟随同样的池过滤
     let source_labels = dispatch::load_policy(&data_dir).model_source_labels;
     let key_bind_for_alias = key_bind.clone();
-    let list = tokio::task::spawn_blocking(move || {
-        if let Some(ref bind) = key_bind {
+    let key_bind_for_ctx = key_bind.clone();
+    let (list, trae_ctx_map, trae_max_map) = tokio::task::spawn_blocking(move || {
+        // Trae 侧实际生效窗口 + Max Mode 支持表（issue #T4.3/T4.4）：
+        // 一次建表，逐模型查询退化为 HashMap 命中
+        let trae_ctx_map = super::models_sync::trae_effective_window_map(&data_dir);
+        let trae_max_map = super::models_sync::trae_max_mode_map(&data_dir);
+        let list = if let Some(ref bind) = key_bind {
             let all = unified_catalog::unified_models_ex(
                 &data_dir,
                 wb_enabled,
@@ -1255,7 +1286,8 @@ pub async fn models(
                 Some((buddy_ai_enabled, buddy_ai_ok)),
                 qoder_flash_free,
             )
-        }
+        };
+        (list, trae_ctx_map, trae_max_map)
     })
     .await
     .unwrap_or_default();
@@ -1283,11 +1315,38 @@ pub async fn models(
             None => m.rate,
         }
     };
+    // 上下文声明（issue #T4.4）：**必须与请求实际能拿到的窗口一致**。
+    //
+    // 历史 bug：统一目录的 context_length 取「调度命中侧」值，未绑定 key 的命中侧
+    // 默认 Buddy 优先 ⇒ `deepseek-v4.1-flash` 声明 Buddy 侧的 1M；但绑 trae 的
+    // key 实际走 `__dev` 通道 200K（且当时 is_max_mode 从不注入）⇒ 客户端按 1M
+    // 规划，发到 20 万以上被上游 `11115 prompt is too long` 拒。
+    //
+    // 修法：有效池是 trae 时改用 Trae **实际生效窗口**（dev，或已开 Max Mode 时
+    // 的 max）；其余池沿用目录声明（那是该池自己的诚实口径）。
+    let ctx_of = |m: &unified_catalog::UnifiedModel| -> Option<u64> {
+        let canonical = unified_catalog::canonical_id(&m.id);
+        // 有效池：key 绑定池（若该模型确实有这一源）→ 否则沿用目录命中侧值
+        let effective_pool = key_bind_for_ctx
+            .as_ref()
+            .filter(|b| {
+                m.sources
+                    .iter()
+                    .any(|s| !s.disabled && &s.pool == *b)
+            })
+            .map(|s| s.as_str());
+        let raw = match effective_pool {
+            Some("trae") => trae_ctx_map.get(&canonical).copied().or(m.context_length),
+            _ => m.context_length,
+        };
+        raw.map(client_safe_window)
+    };
     let mut data: Vec<Value> = list
         .iter()
         .filter(|m| entry_visible(m))
         .map(|m| {
             let rate = rate_of(m);
+            let ctx = ctx_of(m);
             json!({
                 "id": model_id_with_rate(&m.id, rate),
                 "object": "model",
@@ -1300,7 +1359,7 @@ pub async fn models(
                 "name": m.display,
                 "display_name": m.display,
                 "rate": rate,
-                "context_length": m.context_length,
+                "context_length": ctx,
                 "max_tokens": m.max_tokens,
                 "supports_image": m.supports_image,
                 "supported_efforts": m.efforts,
@@ -1330,6 +1389,17 @@ pub async fn models(
                         .map(|b| s.pool == *b || (b == "buddy" && s.pool == "buddy-ai"))
                         .unwrap_or(true)
             }) {
+                // 别名锁定单池（`trae/xxx`）⇒ 上下文与 max_mode 必须按**该池**口径：
+                // trae 用实际生效窗口，其余池沿用目录声明；非 trae 池不可能注入
+                // is_max_mode，故 max_mode 恒 false（与 dispatch::max_mode_for 同源）
+                let alias_canonical = unified_catalog::canonical_id(&m.id);
+                let alias_ctx = match s.pool {
+                    "trae" => trae_ctx_map.get(&alias_canonical).copied().or(m.context_length),
+                    _ => m.context_length,
+                }
+                .map(client_safe_window);
+                let alias_max_mode = s.pool == "trae"
+                    && trae_max_map.get(&alias_canonical).copied().unwrap_or(m.max_mode);
                 data.push(json!({
                     "id": model_id_with_rate(&format!("{}/{}", s.pool, m.id), s.rate),
                     "object": "model",
@@ -1340,11 +1410,11 @@ pub async fn models(
                     "name": m.display,
                     "display_name": m.display,
                     "rate": s.rate,
-                    "context_length": m.context_length,
+                    "context_length": alias_ctx,
                     "max_tokens": m.max_tokens,
                     "supports_image": m.supports_image,
                     "supported_efforts": m.efforts,
-                    "max_mode": m.max_mode,
+                    "max_mode": alias_max_mode,
                     "sources": m.sources,
                     // 别名标记：客户端可据此折叠展示；source_pool = 该 id 实际锁定的池
                     "alias_of": m.id,

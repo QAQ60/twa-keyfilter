@@ -659,7 +659,7 @@ pub fn resolve_target(
             // 可观测性：基名在 Trae 列表但不在 Max Mode 支持表（efforts::
             // TRAE_MAX_MODE_REF）→ 注入层将静默跳过 is_max_mode，落日志避免
             // 「请求带 -max 却无 1M 行为」无从排查（零行为变更）
-            if !super::efforts::trae_max_mode_supported(&canonical_id(&base)) {
+            if !super::models_sync::trae_max_mode_supported(&state.data_dir, &canonical_id(&base)) {
                 crate::fs_utils::app_log(
                     &state.data_dir,
                     &format!(

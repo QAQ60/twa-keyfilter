@@ -125,7 +125,9 @@ pub fn trae_set(data_dir: &Path, model: &str, enabled: bool) -> Result<bool, Str
     let id = non_empty_id(model)?;
     if enabled {
         check_id_len(&id)?;
-        if !super::efforts::trae_max_mode_supported(&id) {
+        // issue #T4.3：支持判定改读官方目录 `max > dev`（每 2h 同步），
+        // 目录未收录时回落静态白名单 —— 新上架模型无需改代码即可开启
+        if !super::models_sync::trae_max_mode_supported(data_dir, &id) {
             return Err(format!("模型 {id} 不支持长上下文"));
         }
     }
@@ -146,7 +148,7 @@ pub fn trae_set(data_dir: &Path, model: &str, enabled: bool) -> Result<bool, Str
 pub fn trae_wants_max(data_dir: &Path, model: &str) -> bool {
     let id = canonical_id(model);
     !id.is_empty()
-        && super::efforts::trae_max_mode_supported(&id)
+        && super::models_sync::trae_max_mode_supported(data_dir, &id)
         && trae_list(data_dir).contains(&id)
 }
 
