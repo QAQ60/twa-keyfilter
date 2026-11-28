@@ -1186,6 +1186,51 @@ pub fn client_safe_window(window: u64) -> u64 {
     window.min(CLIENT_SAFE_CONTEXT_WINDOW)
 }
 
+/// 目录条目**实际会命中的池**（effective pool）—— 倍率 / 上下文 / Max Mode 三处
+/// 判定的唯一来源。
+///
+/// ## 为什么必须统一
+///
+/// 一行目录条目可能由多个池共同服务（`sources`），而「实际命中哪个池」直接决定：
+/// 按谁的倍率计费、能拿多大上下文窗口、`is_max_mode` 会不会注入。此前这三处
+/// 各写一套判定，同一个模型在同一个 key 下能同时出现「倍率按 trae 算、窗口按
+/// buddy 算、max_mode 说支持但走 buddy 永远不注入」的自相矛盾。
+///
+/// ## 判定顺序（与 dispatch 候选序对齐）
+///
+/// ① **key 的 `bind_pool`**：绑定锁死了调度，目录必须与之同口径。`bind_pool=buddy`
+///    时 `buddy-ai` 视为同族（与别名条目的池过滤、`bind_pool_order` 同口径）。
+/// ② 否则按 [`dispatch::POOL_FIXED_ORDER`] 首个**可路由**源 —— 与 dispatch 默认
+///    候选序一致（Buddy 优先）。
+///
+/// ★ `bind` 只在「该模型确实有这个源且未禁用」时才算数：绑 buddy 的 key 请求一个
+/// 纯 trae 模型时实际会走 trae（绑池不产生该模型的能力），目录必须承认这一点，
+/// 否则会出现「按 buddy 口径声明 200K，实际走 trae 给了 900K」的浪费。
+fn effective_pool_of<'a>(
+    m: &'a unified_catalog::UnifiedModel,
+    key_bind: Option<&str>,
+) -> Option<&'a str> {
+    let find_usable = |pool: &str| -> Option<&'a str> {
+        m.sources
+            .iter()
+            .find(|s| !s.disabled && s.pool == pool)
+            .map(|s| s.pool)
+    };
+    if let Some(bind) = key_bind {
+        if let Some(pool) = find_usable(bind) {
+            return Some(pool);
+        }
+        if bind == "buddy" {
+            if let Some(pool) = find_usable("buddy-ai") {
+                return Some(pool);
+            }
+        }
+    }
+    dispatch::POOL_FIXED_ORDER
+        .iter()
+        .find_map(|p| find_usable(p.as_str()))
+}
+
 pub async fn models(
     State(state): State<Arc<ApiSharedState>>,
     Extension(key_id): Extension<KeyId>,
@@ -1331,33 +1376,9 @@ pub async fn models(
     // 一个纯 trae 模型时，实际会走 trae（绑池不产生该模型的能力），目录必须
     // 跟着承认这一点，否则就会出现「按 buddy 口径声明 200K，实际走 trae 给了
     // 900K」的浪费（kimi-k3 就是这么被压低到 200K 的）。
-    let effective_pool_of = |m: &unified_catalog::UnifiedModel| -> Option<&'static str> {
-        let usable = |pool: &str| m.sources.iter().any(|s| !s.disabled && s.pool == pool);
-        if let Some(bind) = key_bind_for_ctx.as_ref() {
-            // bind_pool=buddy 时 buddy-ai 视为同族（与别名条目的池过滤同口径）
-            if usable(bind) {
-                return m
-                    .sources
-                    .iter()
-                    .find(|s| !s.disabled && &s.pool == bind)
-                    .map(|s| s.pool);
-            }
-            if bind == "buddy" && usable("buddy-ai") {
-                return m
-                    .sources
-                    .iter()
-                    .find(|s| !s.disabled && s.pool == "buddy-ai")
-                    .map(|s| s.pool);
-            }
-        }
-        dispatch::POOL_FIXED_ORDER.iter().find_map(|p| {
-            let as_str = p.as_str();
-            m.sources
-                .iter()
-                .find(|s| !s.disabled && s.pool == as_str)
-                .map(|s| s.pool)
-        })
-    };
+    // 有效池判定见 [`effective_pool_of`]（倍率 / 上下文 / Max Mode 的唯一来源）
+    let effective_pool_for =
+        |m: &unified_catalog::UnifiedModel| effective_pool_of(m, key_bind_for_ctx.as_deref());
     // 上下文声明（issue #T4.4 / T4.6）：**必须与请求实际能拿到的窗口一致**。
     //
     // 历史 bug 1：统一目录的 context_length 取「调度命中侧」值，未绑定 key 的命中侧
@@ -1371,7 +1392,7 @@ pub async fn models(
     // max）；其余池沿用目录声明（那是该池自己的诚实口径）。
     let ctx_of = |m: &unified_catalog::UnifiedModel| -> Option<u64> {
         let canonical = unified_catalog::canonical_id(&m.id);
-        let raw = match effective_pool_of(m) {
+        let raw = match effective_pool_for(m) {
             Some("trae") => trae_ctx_map.get(&canonical).copied().or(m.context_length),
             _ => m.context_length,
         };
@@ -1384,7 +1405,7 @@ pub async fn models(
     // 的 key 上 glm-5.3 显示 max_mode=true，但该 key 永远走 buddy，`is_max_mode`
     // 永不注入 ⇒ 声明 900K、实际 200K。这里按有效池收口，与注入决策同源。
     let max_mode_of = |m: &unified_catalog::UnifiedModel| -> bool {
-        match effective_pool_of(m) {
+        match effective_pool_for(m) {
             Some("trae") => {
                 let canonical = unified_catalog::canonical_id(&m.id);
                 trae_max_map
@@ -4236,6 +4257,51 @@ mod tests {
             enabled: false,
             disabled,
         }
+    }
+
+    // ============ 有效池判定（issue #T4.6：ctx / max_mode 的唯一来源） ============
+
+    /// 绑定池优先；绑定池没有该模型的源时，退回 dispatch 候选序首个可路由源。
+    ///
+    /// 这两条正是实测缺陷的回归防线：
+    /// - 绑 buddy 的 key 上 `glm-5.3`（trae+buddy 双源）→ 必须判 buddy，
+    ///   `max_mode` 因此为 false（Buddy 不注入 is_max_mode）；
+    /// - 未绑定的 key 上 `kimi-k3`（仅 trae 源）→ 必须判 trae，
+    ///   才能取到 Trae 实际生效窗口（此前取 buddy 口径压到 200K）。
+    #[test]
+    fn effective_pool_prefers_key_bind_then_candidate_order() {
+        // 双源：trae + buddy
+        let dual = um("glm-5.3", vec![src("buddy", false), src("trae", false)]);
+        assert_eq!(effective_pool_of(&dual, Some("trae")), Some("trae"), "绑定池优先");
+        assert_eq!(effective_pool_of(&dual, Some("buddy")), Some("buddy"), "绑定池优先");
+        // 未绑定：POOL_FIXED_ORDER 中 buddy 在 trae 之前
+        assert_eq!(effective_pool_of(&dual, None), Some("buddy"), "默认候选序 Buddy 优先");
+
+        // 仅 trae 源：即使绑 buddy，该模型也只能走 trae（绑池不产生能力）
+        let trae_only = um("kimi-k3", vec![src("trae", false)]);
+        assert_eq!(
+            effective_pool_of(&trae_only, Some("buddy")),
+            Some("trae"),
+            "绑定池无该模型源时退回候选序"
+        );
+        assert_eq!(effective_pool_of(&trae_only, None), Some("trae"));
+
+        // 源被禁用不算可用
+        let disabled_trae = um("m1", vec![src("trae", true), src("buddy", false)]);
+        assert_eq!(effective_pool_of(&disabled_trae, Some("trae")), Some("buddy"));
+
+        // bind_pool=buddy 时 buddy-ai 视为同族
+        let ai_only = um("intl-model", vec![src("buddy-ai", false)]);
+        assert_eq!(effective_pool_of(&ai_only, Some("buddy")), Some("buddy-ai"));
+        assert_eq!(effective_pool_of(&ai_only, Some("trae")), Some("buddy-ai"));
+    }
+
+    /// 全源被禁 ⇒ 无可路由池（调用方据此不发布该条目 / 不宣称任何能力）。
+    #[test]
+    fn effective_pool_none_when_all_sources_disabled() {
+        let ghost = um("m2", vec![src("trae", true), src("buddy", true)]);
+        assert_eq!(effective_pool_of(&ghost, None), None);
+        assert_eq!(effective_pool_of(&ghost, Some("trae")), None);
     }
 
     #[test]

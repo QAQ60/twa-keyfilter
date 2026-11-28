@@ -2096,6 +2096,40 @@ mod tests {
         assert_eq!(resp["choices"][0]["finish_reason"], "stop");
     }
 
+    /// 响应 `model` 字段回显客户端请求的模型名（2026-11-28 实测缺陷：此前硬写空串）。
+    ///
+    /// OpenAI 规范要求该字段回显模型；空串会让 SDK / 代理层 / 日志分析无法判定
+    /// 实际服务的模型（用户排查「返回空回复是否故障」时也被这点误导）。
+    #[test]
+    fn responses_echo_requested_model() {
+        // 非流式聚合出口
+        let sse = "event: output\ndata: {\"response\":\"ok\"}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        let (resp, err) = aggregate(sse.as_bytes(), "c1", "glm-5.3", None);
+        assert!(err.is_none());
+        assert_eq!(resp.unwrap()["model"], json!("glm-5.3"), "非流式必须回显模型");
+
+        // 流式 chunk 出口
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let _ = stream_convert_lines(
+            InterruptibleLines::from_iterator(Box::new(
+                sse.lines().map(str::to_string).collect::<Vec<_>>().into_iter(),
+            )),
+            tx,
+            "c1",
+            "kimi-k3",
+            None,
+        );
+        let events = collect_events(rx);
+        assert!(
+            events.iter().any(|e| e.contains("\"model\":\"kimi-k3\"")),
+            "流式 chunk 必须回显模型：{events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.contains("\"model\":\"\"")),
+            "不得出现空 model：{events:?}"
+        );
+    }
+
     /// 聚合侧同族回归（Anthropic）：done 收口后迟到的 error 不得丢弃已完整聚合
     /// 的 message（aggregate_anthropic error_info 命中即 return (None, err)）
     #[test]
