@@ -1206,11 +1206,14 @@ pub fn client_safe_window(window: u64) -> u64 {
 /// ★ `bind` 只在「该模型确实有这个源且未禁用」时才算数：绑 buddy 的 key 请求一个
 /// 纯 trae 模型时实际会走 trae（绑池不产生该模型的能力），目录必须承认这一点，
 /// 否则会出现「按 buddy 口径声明 200K，实际走 trae 给了 900K」的浪费。
-fn effective_pool_of<'a>(
-    m: &'a unified_catalog::UnifiedModel,
+fn effective_pool_of(
+    m: &unified_catalog::UnifiedModel,
     key_bind: Option<&str>,
-) -> Option<&'a str> {
-    let find_usable = |pool: &str| -> Option<&'a str> {
+) -> Option<&'static str> {
+    // `UnifiedSource::pool` 是 `&'static str`（池名是编译期常量），
+    // 因此返回值可以标 'static —— 否则闭包里会被推断成借 `m` 的生命期，
+    // 与闭包参数的生命期冲突（实测 CI 报 lifetime may not live long enough）
+    let find_usable = |pool: &str| -> Option<&'static str> {
         m.sources
             .iter()
             .find(|s| !s.disabled && s.pool == pool)
