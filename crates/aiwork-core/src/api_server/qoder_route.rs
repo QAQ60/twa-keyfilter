@@ -2111,7 +2111,7 @@ pub async fn qoder_aggregate_chat(
                         );
                         // P1-2：流式收集阶段按胜者尝试的别名表回改工具名（resp 已是原名）
                         let (resp, error) =
-                            wb_sse::aggregate(translated, &agg_chat_id, tool_alias.as_ref());
+                            wb_sse::aggregate(translated, &agg_chat_id, &model, tool_alias.as_ref());
                         let duration_ms = start_ts.elapsed().as_millis() as u64;
                         // P2-2：传输层掐断优先于一切结果——聚合遇 EOF 掐断会返回
                         // (Some(部分响应), None)，直接当成功交付会把截断数据（可能
@@ -2843,7 +2843,7 @@ mod tests {
         let lines = vec![format!("data: {envelope}"), String::new()].into_iter();
         let translated =
             qoder_upstream::QoderTranslate::new(lines, slot.clone(), "chatcmpl-t", "m");
-        let (resp, error) = wb_sse::aggregate(translated, "chatcmpl-t", None);
+        let (resp, error) = wb_sse::aggregate(translated, "chatcmpl-t", "test-model", None);
         assert!(resp.is_none() && error.is_some(), "信封错误应落解码错误分支");
         let meta = slot.lock().unwrap().clone();
         meta

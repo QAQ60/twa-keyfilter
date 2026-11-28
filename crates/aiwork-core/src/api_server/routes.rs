@@ -1315,31 +1315,85 @@ pub async fn models(
             None => m.rate,
         }
     };
-    // 上下文声明（issue #T4.4）：**必须与请求实际能拿到的窗口一致**。
+    // ==================== 有效池（effective pool）判定 ====================
     //
-    // 历史 bug：统一目录的 context_length 取「调度命中侧」值，未绑定 key 的命中侧
+    // 目录里一行模型可能由多个池共同服务（`sources`），而**实际会命中哪个池**
+    // 决定了三件事：倍率、上下文窗口、Max Mode 是否注入。此前这三处各写一套
+    // 判定，导致口径不一致（rate 跟随 key 绑定池，context 跟随全局候选序，
+    // max_mode 干脆不看池）——同一个模型在同一个 key 下出现「倍率按 trae 算、
+    // 窗口按 buddy 算、max_mode 说支持但走 buddy 永远不注入」的自相矛盾。
+    //
+    // 统一为单一判定，优先级与 dispatch 对齐：
+    //   ① key 绑定的池（bind_pool 锁死了调度，目录必须与之同口径）；
+    //   ② 否则按 POOL_FIXED_ORDER 首个可路由源（dispatch 默认候选序）。
+    //
+    // `bind` 只在**该模型确实有这个源且可用**时才算数：绑 buddy 的 key 请求
+    // 一个纯 trae 模型时，实际会走 trae（绑池不产生该模型的能力），目录必须
+    // 跟着承认这一点，否则就会出现「按 buddy 口径声明 200K，实际走 trae 给了
+    // 900K」的浪费（kimi-k3 就是这么被压低到 200K 的）。
+    let effective_pool_of = |m: &unified_catalog::UnifiedModel| -> Option<&'static str> {
+        let usable = |pool: &str| m.sources.iter().any(|s| !s.disabled && s.pool == pool);
+        if let Some(bind) = key_bind_for_ctx.as_ref() {
+            // bind_pool=buddy 时 buddy-ai 视为同族（与别名条目的池过滤同口径）
+            if usable(bind) {
+                return m
+                    .sources
+                    .iter()
+                    .find(|s| !s.disabled && &s.pool == bind)
+                    .map(|s| s.pool);
+            }
+            if bind == "buddy" && usable("buddy-ai") {
+                return m
+                    .sources
+                    .iter()
+                    .find(|s| !s.disabled && s.pool == "buddy-ai")
+                    .map(|s| s.pool);
+            }
+        }
+        dispatch::POOL_FIXED_ORDER.iter().find_map(|p| {
+            let as_str = p.as_str();
+            m.sources
+                .iter()
+                .find(|s| !s.disabled && s.pool == as_str)
+                .map(|s| s.pool)
+        })
+    };
+    // 上下文声明（issue #T4.4 / T4.6）：**必须与请求实际能拿到的窗口一致**。
+    //
+    // 历史 bug 1：统一目录的 context_length 取「调度命中侧」值，未绑定 key 的命中侧
     // 默认 Buddy 优先 ⇒ `deepseek-v4.1-flash` 声明 Buddy 侧的 1M；但绑 trae 的
-    // key 实际走 `__dev` 通道 200K（且当时 is_max_mode 从不注入）⇒ 客户端按 1M
-    // 规划，发到 20 万以上被上游 `11115 prompt is too long` 拒。
+    // key 实际走 `__dev` 通道 200K ⇒ 客户端按 1M 规划、被上游 `11115` 拒。
+    // 历史 bug 2（本次修）：只处理了 `bind == trae`，未绑定 key 与「绑 buddy 但
+    // 该模型只有 trae 源」两种情况仍取错值（kimi-k3 已开 Max Mode，实得 900K，
+    // 却对未绑定 key 声明 200K）。
     //
-    // 修法：有效池是 trae 时改用 Trae **实际生效窗口**（dev，或已开 Max Mode 时
-    // 的 max）；其余池沿用目录声明（那是该池自己的诚实口径）。
+    // 修法：有效池是 trae 时用 Trae **实际生效窗口**（dev，或已开 Max Mode 时的
+    // max）；其余池沿用目录声明（那是该池自己的诚实口径）。
     let ctx_of = |m: &unified_catalog::UnifiedModel| -> Option<u64> {
         let canonical = unified_catalog::canonical_id(&m.id);
-        // 有效池：key 绑定池（若该模型确实有这一源）→ 否则沿用目录命中侧值
-        let effective_pool = key_bind_for_ctx
-            .as_ref()
-            .filter(|b| {
-                m.sources
-                    .iter()
-                    .any(|s| !s.disabled && &s.pool == *b)
-            })
-            .map(|s| s.as_str());
-        let raw = match effective_pool {
+        let raw = match effective_pool_of(m) {
             Some("trae") => trae_ctx_map.get(&canonical).copied().or(m.context_length),
             _ => m.context_length,
         };
         raw.map(client_safe_window)
+    };
+    // Max Mode 能力（issue #T4.6）：只有**有效池是 trae** 时才可能生效。
+    //
+    // `dispatch::max_mode_for` 的判定是「仅 Trae 池注入 is_max_mode，Buddy/Qoder/
+    // Custom 一律 false」。目录层此前直接报「官方支持表」，不看实际池 ⇒ 绑 buddy
+    // 的 key 上 glm-5.3 显示 max_mode=true，但该 key 永远走 buddy，`is_max_mode`
+    // 永不注入 ⇒ 声明 900K、实际 200K。这里按有效池收口，与注入决策同源。
+    let max_mode_of = |m: &unified_catalog::UnifiedModel| -> bool {
+        match effective_pool_of(m) {
+            Some("trae") => {
+                let canonical = unified_catalog::canonical_id(&m.id);
+                trae_max_map
+                    .get(&canonical)
+                    .copied()
+                    .unwrap_or_else(|| efforts::trae_max_mode_static_fallback(&canonical))
+            }
+            _ => false,
+        }
     };
     let mut data: Vec<Value> = list
         .iter()
@@ -1347,6 +1401,7 @@ pub async fn models(
         .map(|m| {
             let rate = rate_of(m);
             let ctx = ctx_of(m);
+            let max_mode = max_mode_of(m);
             json!({
                 "id": model_id_with_rate(&m.id, rate),
                 "object": "model",
@@ -1363,9 +1418,9 @@ pub async fn models(
                 "max_tokens": m.max_tokens,
                 "supports_image": m.supports_image,
                 "supported_efforts": m.efforts,
-                // Max Mode 支持（issue #38-1：UnifiedModel 已按支持表计算，
-                // 此前手工序列化遗漏导致 release notes/手册声明的字段从未出现在响应中）
-                "max_mode": m.max_mode,
+                // Max Mode 是否**真的会生效**（issue #T4.6：按有效池收口，
+                // 不再只报「官方支持表」——Buddy/Qoder/Custom 池不注入 is_max_mode）
+                "max_mode": max_mode,
                 // 来源池集合：[{pool: "trae"|"buddy", rate, enabled}]（徽章/降级判定
                 // 由客户端按元数据自决，勿硬编码 §3.4）
                 "sources": m.sources,
@@ -1391,7 +1446,9 @@ pub async fn models(
             }) {
                 // 别名锁定单池（`trae/xxx`）⇒ 上下文与 max_mode 必须按**该池**口径：
                 // trae 用实际生效窗口，其余池沿用目录声明；非 trae 池不可能注入
-                // is_max_mode，故 max_mode 恒 false（与 dispatch::max_mode_for 同源）
+                // is_max_mode，故 max_mode 恒 false（与 dispatch::max_mode_for 同源）。
+                // ★ 回落不能用 `m.max_mode`：那是**按有效池收口后**的值（issue #T4.6），
+                //   拿它兜底会让 `trae/xxx` 在目录缺条目时被 buddy 侧的值污染
                 let alias_canonical = unified_catalog::canonical_id(&m.id);
                 let alias_ctx = match s.pool {
                     "trae" => trae_ctx_map.get(&alias_canonical).copied().or(m.context_length),
@@ -1399,7 +1456,9 @@ pub async fn models(
                 }
                 .map(client_safe_window);
                 let alias_max_mode = s.pool == "trae"
-                    && trae_max_map.get(&alias_canonical).copied().unwrap_or(m.max_mode);
+                    && trae_max_map.get(&alias_canonical).copied().unwrap_or_else(|| {
+                        efforts::trae_max_mode_static_fallback(&alias_canonical)
+                    });
                 data.push(json!({
                     "id": model_id_with_rate(&format!("{}/{}", s.pool, m.id), s.rate),
                     "object": "model",
@@ -2538,7 +2597,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                         let (error_info, sent_any, up_usage) = match proto {
                             Protocol::OpenAi => {
                                 let (e, s, u) =
-                                    sse::stream_convert_lines(lines, tx.clone(), &chat_id, tool_alias.as_ref());
+                                    sse::stream_convert_lines(lines, tx.clone(), &chat_id, &model, tool_alias.as_ref());
                                 (e, s, u)
                             }
                             Protocol::OpenAiText => {
@@ -2553,7 +2612,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             }
                             // Responses 仅走 WB 上游；solo 管线兜底按 OpenAI 透传
                             Protocol::Responses => {
-                                let (e, s, u) = sse::stream_convert_lines(lines, tx.clone(), &chat_id, tool_alias.as_ref());
+                                let (e, s, u) = sse::stream_convert_lines(lines, tx.clone(), &chat_id, &model, tool_alias.as_ref());
                                 (e, s, u)
                             }
                         };
@@ -3101,11 +3160,11 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                             Protocol::Responses => format!("resp_{}", now_ts()),
                         };
                         let (resp, error_info) = match proto {
-                            Protocol::OpenAi => sse::aggregate(reader, &chat_id, tool_alias.as_ref()),
+                            Protocol::OpenAi => sse::aggregate(reader, &chat_id, &model, tool_alias.as_ref()),
                             Protocol::OpenAiText => sse::aggregate_text(reader, &chat_id, &model),
                             Protocol::Anthropic => sse::aggregate_anthropic(reader, &chat_id, &model, tool_alias.as_ref()),
                             // Responses 仅走 WB 上游；solo 管线兜底按 OpenAI 聚合
-                            Protocol::Responses => sse::aggregate(reader, &chat_id, tool_alias.as_ref()),
+                            Protocol::Responses => sse::aggregate(reader, &chat_id, &model, tool_alias.as_ref()),
                         };
                         let duration_ms = start_ts.elapsed().as_millis() as u64;
                         match (resp, error_info) {

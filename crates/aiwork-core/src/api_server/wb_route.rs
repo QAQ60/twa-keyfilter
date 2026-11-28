@@ -2967,7 +2967,7 @@ pub(crate) fn wb_aggregate_core(
                     guard = settle_hedge(&state, &mut win, guard, &picked.uid);
                     let win_uid = win.uid.as_str();
                     let (resp, error_info) =
-                        wb_sse::aggregate(win.lines, &format!("chatcmpl-{}", now_ts()), tool_alias.as_ref());
+                        wb_sse::aggregate(win.lines, &format!("chatcmpl-{}", now_ts()), &model, tool_alias.as_ref());
                     // P2-2：读错误槽合并——掐断时丢弃部分响应（非流式不得把
                     // 截断数据当成功交付，可能含残缺 tool_calls JSON），按流内
                     // 错误换号重试
@@ -3448,7 +3448,7 @@ pub async fn wb_tool_exec_chat(
                         };
                         last_ttfb_ms = Some(ttfb_start.elapsed().as_millis() as u64);
                         let (completion, error_info) =
-                            wb_sse::aggregate(lines, &format!("chatcmpl-{}", now_ts()), tool_alias.as_ref());
+                            wb_sse::aggregate(lines, &format!("chatcmpl-{}", now_ts()), &model, tool_alias.as_ref());
                         // P2-2：读错误槽合并——掐断丢弃部分响应，按轮失败处理
                         let (completion, error_info) =
                             aggregate_with_transport_cut(completion, error_info, &read_slot);

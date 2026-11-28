@@ -971,9 +971,12 @@ pub fn stream_forward(
 
 /// 非流式聚合：WB SSE → 内部 OpenAI completion（tool_calls 按 index 合并）
 /// 返回 (completion|None, error|None)
+/// `model` 是客户端请求的模型名，原样回填响应 `model` 字段（此前硬写空串，
+/// 客户端/SDK 无法据响应判定实际服务的模型）。
 pub fn aggregate<L: Iterator<Item = String>>(
     lines: L,
     chat_id: &str,
+    model: &str,
     tool_alias: Option<&ToolAliasReverse>,
 ) -> (Option<Value>, Option<(i64, String)>) {
     let mut parser = WbSseParser::new(lines);
@@ -1061,7 +1064,7 @@ pub fn aggregate<L: Iterator<Item = String>>(
         "id": chat_id,
         "object": "chat.completion",
         "created": now_ts(),
-        "model": "",
+        "model": model,
         "choices": [{ "index": 0, "message": message, "finish_reason": if finish.is_empty() { "stop" } else { &finish } }],
     });
     if let Some(u) = usage {
@@ -1408,6 +1411,7 @@ mod tests {
                 "",
             ]),
             "chat-1",
+            "test-model",
             None,
         );
         let (resp, err) = out;
@@ -1426,6 +1430,7 @@ mod tests {
         let (resp, err) = aggregate(
             lines(&["data: {\"error\":{\"message\":\"boom\",\"code\":9}}", ""]),
             "c",
+            "test-model",
             None,
         );
         assert!(resp.is_none());
@@ -1434,7 +1439,7 @@ mod tests {
 
     #[test]
     fn converters_roundtrip() {
-        let (resp, _) = aggregate(lines(&["data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}", "data: [DONE]", ""]), "c1", None);
+        let (resp, _) = aggregate(lines(&["data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}", "data: [DONE]", ""]), "c1", "test-model", None);
         let v = resp.unwrap();
         let anth = completion_to_anthropic(&v, "msg_1", "glm-5.3", None);
         assert_eq!(anth["type"], json!("message"));

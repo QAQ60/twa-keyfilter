@@ -184,15 +184,20 @@ pub fn stream_convert_lines(
     lines: InterruptibleLines,
     sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     chat_id: &str,
+    model: &str,
     tool_alias: Option<&ToolAliasReverse>,
 ) -> (Option<(i64, String)>, bool, Option<Value>) {
-    stream_convert_src(lines, sender, chat_id, tool_alias)
+    stream_convert_src(lines, sender, chat_id, model, tool_alias)
 }
 
+/// `model` 是**客户端请求的模型名**，原样回填每个 chunk 的 `model` 字段。
+/// 此前硬写空串：OpenAI 规范要求该字段回显模型，部分 SDK / 代理层 / 日志分析
+/// 会据此判定「响应来自哪个模型」，空串等于信息缺失（2026-11-28 实测确认）。
 fn stream_convert_src(
     mut src: LineSrc,
     sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     chat_id: &str,
+    model: &str,
     tool_alias: Option<&ToolAliasReverse>,
 ) -> (Option<(i64, String)>, bool, Option<Value>) {
     let mut st = SseState::new();
@@ -222,7 +227,7 @@ fn stream_convert_src(
             "id": chat_id,
             "object": "chat.completion.chunk",
             "created": now_ts(),
-            "model": "",
+            "model": model,
             "choices": choices,
         });
         if pending_usage.is_some() {
@@ -810,6 +815,7 @@ fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
 pub fn aggregate<R: Read + Send>(
     reader: R,
     chat_id: &str,
+    model: &str,
     tool_alias: Option<&ToolAliasReverse>,
 ) -> (Option<Value>, Option<(i64, String)>) {
     let mut c = collect_plain(reader);
@@ -870,7 +876,7 @@ pub fn aggregate<R: Read + Send>(
         "id": chat_id,
         "object": "chat.completion",
         "created": now_ts(),
-        "model": "",
+        "model": model,
         "choices": [{
             "index": 0,
             "message": message,
@@ -2031,6 +2037,7 @@ mod tests {
             InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
             tx,
             "c1",
+            "test-model",
             None,
         );
         assert_eq!(error_info, None, "done 后迟到的 error 不得改写终态");
@@ -2082,7 +2089,7 @@ mod tests {
             "event: error\ndata: {\"code\":500,\"message\":\"迟到错误\"}\n",
             "\n",
         );
-        let (resp, err) = aggregate(sse.as_bytes(), "c1", None);
+        let (resp, err) = aggregate(sse.as_bytes(), "c1", "test-model", None);
         assert!(err.is_none(), "done 后迟到的 error 不得改写终态：{err:?}");
         let resp = resp.expect("完整聚合的 completion 应保留");
         assert_eq!(resp["choices"][0]["message"]["content"], "答");
@@ -2118,12 +2125,12 @@ mod tests {
         let cursor_lines =
             std::io::Cursor::new(input).lines().map(|l| l.expect("读行失败"));
         let (e1, s1, _) =
-            stream_convert_lines(InterruptibleLines::from_iterator(Box::new(cursor_lines)), tx, "c1", None);
+            stream_convert_lines(InterruptibleLines::from_iterator(Box::new(cursor_lines)), tx, "c1", "test-model", None);
         // 内存切分形态（首字超时包装产物形态）
         let (tx2, rx2) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
         let lines: InterruptibleLines =
             InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string)));
-        let (e2, s2, _) = stream_convert_lines(lines, tx2, "c1", None);
+        let (e2, s2, _) = stream_convert_lines(lines, tx2, "c1", "test-model", None);
         assert_eq!(e1, e2);
         assert_eq!(s1, s2);
         let a = collect_events(rx).join("\n");
@@ -2144,6 +2151,7 @@ mod tests {
             InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
             tx,
             "c1",
+            "test-model",
             None,
         );
         let (code, msg) = error_info.expect("空完成必须返回哨兵错误");
@@ -2166,6 +2174,7 @@ mod tests {
             InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
             tx,
             "c1",
+            "test-model",
             None,
         );
         let (code, _msg) = error_info.expect("EOF 零内容必须返回哨兵错误");
@@ -2253,7 +2262,7 @@ mod tests {
             err: "http2 stream error RST_STREAM",
         })
         .expect("首行应正常产出");
-        let (error_info, sent_any, _) = stream_convert_lines(src, tx, "c1", None);
+        let (error_info, sent_any, _) = stream_convert_lines(src, tx, "c1", "test-model", None);
         let (code, msg) = error_info.expect("掐断应上抛哨兵");
         assert_eq!(code, crate::api_server::TRANSPORT_CUT_CODE);
         assert!(crate::api_server::is_transport_cut(code, &msg));
@@ -2281,7 +2290,7 @@ mod tests {
             err: "connection reset by peer",
         })
         .expect("首行应正常产出");
-        let (error_info, sent_any, _) = stream_convert_lines(src, tx, "c1", None);
+        let (error_info, sent_any, _) = stream_convert_lines(src, tx, "c1", "test-model", None);
         let (code, msg) = error_info.expect("掐断应上抛哨兵");
         assert_eq!(code, crate::api_server::TRANSPORT_CUT_CODE);
         assert!(crate::api_server::is_transport_cut(code, &msg));
@@ -2303,7 +2312,7 @@ mod tests {
             err: "weird os error 42",
         })
         .expect("首行应正常产出");
-        let (error_info, sent_any, _) = stream_convert_lines(src, tx, "c1", None);
+        let (error_info, sent_any, _) = stream_convert_lines(src, tx, "c1", "test-model", None);
         let (code, _msg) = error_info.expect("EOF 零内容仍应命中空完成哨兵");
         assert_eq!(code, crate::api_server::EMPTY_COMPLETION_CODE);
         assert!(!sent_any);
@@ -2364,6 +2373,7 @@ mod tests {
             InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
             tx,
             "c1",
+            "test-model",
             None,
         );
         assert!(error_info.is_none(), "有内容不得触发哨兵");
@@ -2382,7 +2392,7 @@ mod tests {
             pos: 0,
             err: "http2 stream error RST_STREAM",
         };
-        let (resp, err) = aggregate(reader, "c1", None);
+        let (resp, err) = aggregate(reader, "c1", "test-model", None);
         assert!(resp.is_none(), "截断的部分响应必须丢弃，不得当成功交付");
         let (code, msg) = err.expect("断流必须转错误通道");
         assert_eq!(code, crate::api_server::TRANSPORT_CUT_CODE);
@@ -2400,7 +2410,7 @@ mod tests {
             pos: 0,
             err: "connection reset by peer",
         };
-        let (resp, err) = aggregate(reader, "c1", None);
+        let (resp, err) = aggregate(reader, "c1", "test-model", None);
         assert!(resp.is_none());
         let (code, msg) = err.expect("零内容断流也必须上抛哨兵");
         assert!(crate::api_server::is_transport_cut(code, &msg));
@@ -2417,7 +2427,7 @@ mod tests {
             pos: 0,
             err: "http2 stream error RST_STREAM",
         };
-        let (resp, err) = aggregate(reader, "c1", None);
+        let (resp, err) = aggregate(reader, "c1", "test-model", None);
         assert!(err.is_none(), "已收到 done 后的连接收尾错误不得推翻完整响应");
         let resp = resp.expect("完整响应应正常返回");
         assert_eq!(resp["choices"][0]["message"]["content"], "complete");
@@ -2448,7 +2458,7 @@ mod tests {
             "event: output\ndata: {\"response\":\"\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"北京\\\"}\"}}]}\n\n",
             "event: done\ndata: {\"finish_reason\":\"tool_calls\"}\n\n",
         );
-        let (resp, err) = aggregate(std::io::Cursor::new(input), "c1", None);
+        let (resp, err) = aggregate(std::io::Cursor::new(input), "c1", "test-model", None);
         assert!(err.is_none());
         let resp = resp.expect("tool_calls 流必须产出聚合结果");
         let msg = &resp["choices"][0]["message"];
@@ -2479,6 +2489,7 @@ mod tests {
             InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
             tx,
             "c1",
+            "test-model",
             None,
         );
         assert!(error_info.is_none());
@@ -2514,6 +2525,7 @@ mod tests {
                 )),
                 tx,
                 "c1",
+                "test-model",
                 None,
             );
             assert!(error_info.is_none());
@@ -2537,6 +2549,7 @@ mod tests {
             InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
             tx,
             "c1",
+            "test-model",
             None,
         );
         assert!(error_info.is_none());
@@ -2553,6 +2566,7 @@ mod tests {
             InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
             tx,
             "c1",
+            "test-model",
             None,
         );
         assert!(error_info.is_none());
@@ -2572,7 +2586,7 @@ mod tests {
             "event: output\ndata: {\"response\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}\n\n",
             "event: done\ndata: {\"finish_reason\":\"stop\"}\n\n",
         );
-        let (resp, err) = aggregate(std::io::Cursor::new(input), "c1", None);
+        let (resp, err) = aggregate(std::io::Cursor::new(input), "c1", "test-model", None);
         assert!(err.is_none());
         let resp = resp.expect("聚合结果");
         assert_eq!(resp["choices"][0]["finish_reason"], "tool_calls");
@@ -2838,7 +2852,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
         let lines: InterruptibleLines =
             InterruptibleLines::from_iterator(Box::new(ALIAS_TOOL_SSE.lines().map(str::to_string)));
-        let (e, s, _) = stream_convert_lines(lines, tx, "c1", Some(&alias_reverse()));
+        let (e, s, _) = stream_convert_lines(lines, tx, "c1", "test-model", Some(&alias_reverse()));
         assert_eq!(e, None);
         assert!(s);
         let joined = collect_events(rx).join("\n");
@@ -2854,7 +2868,7 @@ mod tests {
     /// OpenAI 非流式聚合：合并后 tool_calls.function.name 回改原名
     #[test]
     fn tool_alias_reverse_applied_on_aggregate() {
-        let (v, err) = aggregate(std::io::Cursor::new(ALIAS_TOOL_SSE), "c1", Some(&alias_reverse()));
+        let (v, err) = aggregate(std::io::Cursor::new(ALIAS_TOOL_SSE), "c1", "test-model", Some(&alias_reverse()));
         assert!(err.is_none());
         let v = v.expect("聚合应产出消息");
         assert_eq!(
